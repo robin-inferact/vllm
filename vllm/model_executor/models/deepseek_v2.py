@@ -385,12 +385,11 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states=hidden_states, router_logits=router_logits
             )
 
-        if not getattr(self, "skip_final_allreduce", False):
-            if self.is_sequence_parallel:
-                final_hidden_states = tensor_model_parallel_all_gather(
-                    final_hidden_states, 0
-                )
-                final_hidden_states = final_hidden_states[:num_tokens]
+        if self.is_sequence_parallel:
+            final_hidden_states = tensor_model_parallel_all_gather(
+                final_hidden_states, 0
+            )
+            final_hidden_states = final_hidden_states[:num_tokens]
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 

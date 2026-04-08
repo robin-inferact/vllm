@@ -50,6 +50,11 @@ class DummyModelLoader(BaseModelLoader):
             fuse_indexer_weights = getattr(layer, "fuse_indexer_weights", None)
             if callable(fuse_indexer_weights):
                 fuse_indexer_weights()
+            fuse_shared_expert_act_quant = getattr(
+                layer, "fuse_shared_expert_act_quant", None
+            )
+            if callable(fuse_shared_expert_act_quant):
+                fuse_shared_expert_act_quant()
 
     def _process_online_quant_layer(
         self,

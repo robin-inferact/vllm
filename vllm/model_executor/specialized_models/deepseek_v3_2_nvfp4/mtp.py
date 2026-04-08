@@ -15,19 +15,19 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
+from vllm.model_executor.models.deepseek_mtp import DeepSeekMTP as DeepSeekMTPBase
+from vllm.model_executor.models.deepseek_mtp import (
+    DeepSeekMultiTokenPredictor as DeepSeekMultiTokenPredictorBase,
+)
+from vllm.model_executor.models.deepseek_mtp import (
+    DeepSeekMultiTokenPredictorLayer as DeepSeekMultiTokenPredictorLayerBase,
+)
+from vllm.model_executor.models.deepseek_mtp import SharedHead as SharedHeadBase
+from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE
+from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
-from ..deepseek_mtp import DeepSeekMTP as DeepSeekMTPBase
-from ..deepseek_mtp import (
-    DeepSeekMultiTokenPredictor as DeepSeekMultiTokenPredictorBase,
-)
-from ..deepseek_mtp import (
-    DeepSeekMultiTokenPredictorLayer as DeepSeekMultiTokenPredictorLayerBase,
-)
-from ..deepseek_mtp import SharedHead as SharedHeadBase
-from ..deepseek_v2 import DeepseekV2MoE
-from ..utils import maybe_prefix
 from .decoder_layer import MonolithicDecoderLayer
 from .model import remap_monolithic_weight_name
 

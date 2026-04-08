@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Monolithic DeepSeek V3.2 MTP model."""
+"""DeepSeek V3.2 MTP model for SM100 (Blackwell)."""
 
 from collections.abc import Iterable
 
@@ -28,8 +28,8 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
-from .decoder_layer import MonolithicDecoderLayer
-from .model import remap_monolithic_weight_name
+from .layer import DeepseekV32DecoderLayer
+from .model import remap_weight_name
 
 logger = init_logger(__name__)
 
@@ -61,7 +61,7 @@ class DeepSeekMultiTokenPredictorLayer(DeepSeekMultiTokenPredictorLayerBase):
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=quant_config
         )
-        self.mtp_block = MonolithicDecoderLayer(
+        self.mtp_block = DeepseekV32DecoderLayer(
             vllm_config=vllm_config,
             config=config,
             layer_idx=int(prefix.rsplit(".", 1)[-1]),
@@ -124,7 +124,7 @@ class DeepSeekMTP(DeepSeekMTPBase):
         example_moe = None
         for layer in self.model.layers.values():
             layer = layer.mtp_block
-            assert isinstance(layer, MonolithicDecoderLayer)
+            assert isinstance(layer, DeepseekV32DecoderLayer)
             if isinstance(layer.mlp, DeepseekV2MoE):
                 example_moe = layer.mlp
                 self.moe_mlp_layers.append(layer.mlp)
@@ -154,7 +154,7 @@ class DeepSeekMTP(DeepSeekMTPBase):
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         name = super()._rewrite_spec_layer_name(spec_layer, name)
-        return remap_monolithic_weight_name(name)
+        return remap_weight_name(name)
 
 
 @torch.compile

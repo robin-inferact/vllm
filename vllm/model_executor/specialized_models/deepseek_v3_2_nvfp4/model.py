@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Monolithic DeepSeek V3.2 model for SM100 (Blackwell).
+DeepSeek V3.2 model for SM100 (Blackwell).
 No PP, TP only, same checkpoint compatibility.
 """
 
@@ -22,13 +22,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.platforms import current_platform
 
-from .decoder_layer import MonolithicDecoderLayer
+from .layer import DeepseekV32DecoderLayer
 
 logger = init_logger(__name__)
 
 
 @support_torch_compile
-class MonolithicDeepseekV32Model(nn.Module):
+class DeepseekV32Model(nn.Module):
     """Transformer backbone."""
 
     fall_back_to_pt_during_load = False
@@ -57,7 +57,7 @@ class MonolithicDeepseekV32Model(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                MonolithicDecoderLayer(
+                DeepseekV32DecoderLayer(
                     vllm_config=vllm_config,
                     config=config,
                     layer_idx=i,
@@ -89,7 +89,7 @@ class MonolithicDeepseekV32Model(nn.Module):
 
 class DeepseekV32ForCausalLM(nn.Module):
     """
-    Monolithic DeepSeek V3.2 CausalLM for SM100.
+    DeepSeek V3.2 CausalLM for SM100.
     """
 
     packed_modules_mapping = {
@@ -105,7 +105,7 @@ class DeepseekV32ForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.tp_size = get_tensor_model_parallel_world_size()
 
-        self.model = MonolithicDeepseekV32Model(
+        self.model = DeepseekV32Model(
             vllm_config=vllm_config,
             prefix=f"{prefix}.model" if prefix else "model",
         )
@@ -165,11 +165,11 @@ class DeepseekV32ForCausalLM(nn.Module):
         # Only remap layernorms and indexer (underscore prefix).
         # Everything else (fused_qkv_a_proj, experts, gate, etc.) uses the
         # same module paths as the original model.
-        return remap_monolithic_weight_name(name)
+        return remap_weight_name(name)
 
 
-def remap_monolithic_weight_name(name: str) -> str:
-    """Remap checkpoint names that differ from the monolithic module layout."""
+def remap_weight_name(name: str) -> str:
+    """Remap checkpoint names that differ from the module layout."""
     replacements = [
         (
             "self_attn.q_a_layernorm.weight",

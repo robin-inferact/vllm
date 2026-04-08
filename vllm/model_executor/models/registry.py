@@ -67,12 +67,21 @@ from .interfaces_base import (
 
 logger = init_logger(__name__)
 
-_DEEPSEEK_V32_MODEL = (
-    ("deepseek_v3_2_monolithic", "DeepseekV32ForCausalLM")
-    if envs.VLLM_USE_DEEPSEEK_V32_MONOLITHIC_MODEL
-    else ("deepseek_v2", "DeepseekV3ForCausalLM")
-)
-_DEEPSEEK_V32_MTP_MODEL = ("deepseek_v3_2_monolithic", "DeepSeekMTP")
+_SPECIALIZED_TEXT_GENERATION_MODELS = {
+    "DeepseekV32ForCausalLM": (
+        "vllm.model_executor.specialized_models.deepseek_v3_2_nvfp4",
+        "DeepseekV32ForCausalLM",
+    ),
+}
+_SPECIALIZED_MTP_MODEL_ARCH_BY_BASE_ARCH = {
+    "DeepseekV32ForCausalLM": "_SpecializedDeepSeekV32MTPModel",
+}
+_SPECIALIZED_MTP_MODELS = {
+    "_SpecializedDeepSeekV32MTPModel": (
+        "vllm.model_executor.specialized_models.deepseek_v3_2_nvfp4",
+        "DeepSeekMTP",
+    ),
+}
 
 _TEXT_GENERATION_MODELS = {
     # [Decoder-only]
@@ -102,7 +111,7 @@ _TEXT_GENERATION_MODELS = {
     "DeepseekForCausalLM": ("deepseek_v2", "DeepseekForCausalLM"),
     "DeepseekV2ForCausalLM": ("deepseek_v2", "DeepseekV2ForCausalLM"),
     "DeepseekV3ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
-    "DeepseekV32ForCausalLM": _DEEPSEEK_V32_MODEL,
+    "DeepseekV32ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
     "Dots1ForCausalLM": ("dots1", "Dots1ForCausalLM"),
     "Ernie4_5ForCausalLM": ("ernie45", "Ernie4_5ForCausalLM"),
     "Ernie4_5_MoeForCausalLM": ("ernie45_moe", "Ernie4_5_MoeForCausalLM"),
@@ -593,7 +602,6 @@ _SPECULATIVE_DECODING_MODELS = {
     "Eagle3DeepseekV3ForCausalLM": ("deepseek_eagle3", "Eagle3DeepseekV2ForCausalLM"),
     "EagleDeepSeekMTPModel": ("deepseek_eagle", "EagleDeepseekV3ForCausalLM"),
     "DeepSeekMTPModel": ("deepseek_mtp", "DeepSeekMTP"),
-    "_DeepSeekV32MonolithicMTPModel": _DEEPSEEK_V32_MTP_MODEL,
     "ErnieMTPModel": ("ernie_mtp", "ErnieMTP"),
     "ExaoneMoeMTP": ("exaone_moe_mtp", "ExaoneMoeMTP"),
     "Exaone4_5_MTP": ("exaone4_5_mtp", "Exaone4_5_MTP"),
@@ -613,6 +621,10 @@ _SPECULATIVE_DECODING_MODELS = {
     # # TODO(woosuk): Re-enable this once the MLP Speculator is supported in V1.
     # "MLPSpeculatorPreTrainedModel": ("mlp_speculator", "MLPSpeculator"),
 }
+
+if envs.VLLM_USE_SPECIALIZED_MODELS:
+    _TEXT_GENERATION_MODELS.update(_SPECIALIZED_TEXT_GENERATION_MODELS)
+    _TEXT_GENERATION_MODELS.update(_SPECIALIZED_MTP_MODELS)
 
 _TRANSFORMERS_SUPPORTED_MODELS = {
     # Text generation models
@@ -1091,12 +1103,15 @@ class _ModelRegistry:
         architecture: str,
         model_config: ModelConfig,
     ) -> str:
-        if (
-            architecture == "DeepSeekMTPModel"
-            and envs.VLLM_USE_DEEPSEEK_V32_MONOLITHIC_MODEL
-            and hasattr(model_config.hf_config, "index_topk")
-        ):
-            return "_DeepSeekV32MonolithicMTPModel"
+        if architecture == "DeepSeekMTPModel" and envs.VLLM_USE_SPECIALIZED_MODELS:
+            base_arch = (
+                "DeepseekV32ForCausalLM"
+                if hasattr(model_config.hf_config, "index_topk")
+                else None
+            )
+            specialized_arch = _SPECIALIZED_MTP_MODEL_ARCH_BY_BASE_ARCH.get(base_arch)
+            if specialized_arch is not None:
+                return specialized_arch
 
         if architecture in self.models:
             return architecture
@@ -1317,7 +1332,11 @@ class _ModelRegistry:
 ModelRegistry = _ModelRegistry(
     {
         model_arch: _LazyRegisteredModel(
-            module_name=f"vllm.model_executor.models.{mod_relname}",
+            module_name=(
+                mod_relname
+                if mod_relname.startswith("vllm.")
+                else f"vllm.model_executor.models.{mod_relname}"
+            ),
             class_name=cls_name,
         )
         for model_arch, (mod_relname, cls_name) in _VLLM_MODELS.items()

@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Custom Sparse Attention Indexer layers."""
+
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -11,6 +14,8 @@ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 
 def sparse_attn_indexer(
@@ -34,7 +39,13 @@ def sparse_attn_indexer(
         current_workspace_manager().get_simultaneous(
             ((total_seq_lens, head_dim), torch.float8_e4m3fn),
             ((total_seq_lens, 4), torch.uint8),
+            ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
         )
+
+        # Dummy allocation to simulate for peak logits tensor memory during inference.
+        # FP8 elements so elements == bytes
+        max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+        _ = torch.empty(max_logits_elems, dtype=torch.uint8, device=q_fp8.device)
         return None
 
     attn_metadata = attn_metadata[k_cache_prefix]
@@ -56,13 +67,16 @@ def sparse_attn_indexer(
         for chunk in prefill_metadata.chunks:
             k_fp8 = k_fp8_full[: chunk.total_seq_lens]
             k_scale = k_scale_full[: chunk.total_seq_lens]
-            ops.cp_gather_indexer_k_quant_cache(
-                kv_cache,
-                k_fp8,
-                k_scale,
-                chunk.block_table,
-                chunk.cu_seq_lens,
-            )
+
+            if not chunk.skip_kv_gather:
+                ops.cp_gather_indexer_k_quant_cache(
+                    kv_cache,
+                    k_fp8,
+                    k_scale,
+                    chunk.block_table,
+                    chunk.cu_seq_lens,
+                )
+
             logits = fp8_mqa_logits(
                 q_fp8[chunk.token_start : chunk.token_end],
                 (k_fp8, k_scale.view(torch.float32).flatten()),
@@ -126,35 +140,29 @@ def sparse_attn_indexer(
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if decode_metadata.use_large_context_topk:
-            if next_n == 1:
-                lengths = decode_metadata.seq_lens
-            else:
-                # (bs,) -> (bs, 1) + (next_n,) -> (bs, next_n) -> (bs * next_n,)
-                lengths = (
-                    decode_metadata.seq_lens.unsqueeze(1)
-                    - next_n
-                    + 1
-                    + decode_metadata.offsets
-                ).flatten()
-
-            torch.ops._C.large_context_topk(
-                logits,
-                topk_indices,
-                lengths,
-                None,
-            )
+        if next_n == 1:
+            lengths = decode_metadata.seq_lens
         else:
-            torch.ops._C.top_k_per_row_decode(
-                logits,
-                next_n,
-                decode_metadata.seq_lens,
-                topk_indices,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                topk_tokens,
-            )
+            # (bs,) -> (bs, 1) + (next_n,) -> (bs, next_n) -> (bs * next_n,)
+            lengths = (
+                decode_metadata.seq_lens.unsqueeze(1)
+                - next_n
+                + 1
+                + decode_metadata.offsets
+            ).flatten()
+
+        workspace_manager = current_workspace_manager()
+        (topk_workspace,) = workspace_manager.get_simultaneous(
+            ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+        )
+        torch.ops._C.persistent_topk(
+            logits,
+            lengths,
+            topk_indices,
+            topk_workspace,
+            topk_tokens,
+            attn_metadata.max_seq_len,
+        )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
@@ -166,5 +174,3 @@ def sparse_attn_indexer(
             topk_indices_buffer[:num_decode_tokens, : topk_indices.shape[-1]] = (
                 topk_indices
             )
-
-    return topk_indices_buffer

@@ -87,7 +87,7 @@ class MonolithicDeepseekV32Model(nn.Module):
         return hidden_states
 
 
-class DeepseekV32MonolithicForCausalLM(nn.Module):
+class DeepseekV32ForCausalLM(nn.Module):
     """
     Monolithic DeepSeek V3.2 CausalLM for SM100.
     """
@@ -165,21 +165,26 @@ class DeepseekV32MonolithicForCausalLM(nn.Module):
         # Only remap layernorms and indexer (underscore prefix).
         # Everything else (fused_qkv_a_proj, experts, gate, etc.) uses the
         # same module paths as the original model.
-        replacements = [
-            (
-                "self_attn.q_a_layernorm.weight",
-                "attn.q_a_layernorm_weight",
-            ),
-            (
-                "self_attn.kv_a_layernorm.weight",
-                "attn.kv_a_layernorm_weight",
-            ),
-            ("self_attn.q_b_proj", "attn.q_b_proj"),
-            ("self_attn.kv_b_proj", "attn.kv_b_proj"),
-            ("self_attn.o_proj", "attn.o_proj"),
-            ("self_attn.indexer.", "attn.indexer_"),
-        ]
-        for old, new in replacements:
-            if old in name:
-                return name.replace(old, new)
-        return name
+        return remap_monolithic_weight_name(name)
+
+
+def remap_monolithic_weight_name(name: str) -> str:
+    """Remap checkpoint names that differ from the monolithic module layout."""
+    replacements = [
+        (
+            "self_attn.q_a_layernorm.weight",
+            "attn.q_a_layernorm_weight",
+        ),
+        (
+            "self_attn.kv_a_layernorm.weight",
+            "attn.kv_a_layernorm_weight",
+        ),
+        ("self_attn.q_b_proj", "attn.q_b_proj"),
+        ("self_attn.kv_b_proj", "attn.kv_b_proj"),
+        ("self_attn.o_proj", "attn.o_proj"),
+        ("self_attn.indexer.", "attn.indexer_"),
+    ]
+    for old, new in replacements:
+        if old in name:
+            return name.replace(old, new)
+    return name

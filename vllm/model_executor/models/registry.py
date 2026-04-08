@@ -67,6 +67,13 @@ from .interfaces_base import (
 
 logger = init_logger(__name__)
 
+_DEEPSEEK_V32_MODEL = (
+    ("deepseek_v3_2_monolithic", "DeepseekV32ForCausalLM")
+    if envs.VLLM_USE_DEEPSEEK_V32_MONOLITHIC_MODEL
+    else ("deepseek_v2", "DeepseekV3ForCausalLM")
+)
+_DEEPSEEK_V32_MTP_MODEL = ("deepseek_v3_2_monolithic", "DeepSeekMTP")
+
 _TEXT_GENERATION_MODELS = {
     # [Decoder-only]
     "AfmoeForCausalLM": ("afmoe", "AfmoeForCausalLM"),
@@ -95,11 +102,7 @@ _TEXT_GENERATION_MODELS = {
     "DeepseekForCausalLM": ("deepseek_v2", "DeepseekForCausalLM"),
     "DeepseekV2ForCausalLM": ("deepseek_v2", "DeepseekV2ForCausalLM"),
     "DeepseekV3ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
-    # "DeepseekV32ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
-    "DeepseekV32ForCausalLM": (
-        "deepseek_v3_2_monolithic",
-        "DeepseekV32MonolithicForCausalLM",
-    ),
+    "DeepseekV32ForCausalLM": _DEEPSEEK_V32_MODEL,
     "Dots1ForCausalLM": ("dots1", "Dots1ForCausalLM"),
     "Ernie4_5ForCausalLM": ("ernie45", "Ernie4_5ForCausalLM"),
     "Ernie4_5_MoeForCausalLM": ("ernie45_moe", "Ernie4_5_MoeForCausalLM"),
@@ -590,6 +593,7 @@ _SPECULATIVE_DECODING_MODELS = {
     "Eagle3DeepseekV3ForCausalLM": ("deepseek_eagle3", "Eagle3DeepseekV2ForCausalLM"),
     "EagleDeepSeekMTPModel": ("deepseek_eagle", "EagleDeepseekV3ForCausalLM"),
     "DeepSeekMTPModel": ("deepseek_mtp", "DeepSeekMTP"),
+    "_DeepSeekV32MonolithicMTPModel": _DEEPSEEK_V32_MTP_MODEL,
     "ErnieMTPModel": ("ernie_mtp", "ErnieMTP"),
     "ExaoneMoeMTP": ("exaone_moe_mtp", "ExaoneMoeMTP"),
     "Exaone4_5_MTP": ("exaone4_5_mtp", "Exaone4_5_MTP"),
@@ -1087,6 +1091,13 @@ class _ModelRegistry:
         architecture: str,
         model_config: ModelConfig,
     ) -> str:
+        if (
+            architecture == "DeepSeekMTPModel"
+            and envs.VLLM_USE_DEEPSEEK_V32_MONOLITHIC_MODEL
+            and hasattr(model_config.hf_config, "index_topk")
+        ):
+            return "_DeepSeekV32MonolithicMTPModel"
+
         if architecture in self.models:
             return architecture
 

@@ -18,7 +18,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
 from .attention import MonolithicMLAAttention
-from .ops import fused_norm_rope, fused_q
+from .kernels import fused_norm_rope, fused_q
 from .sparse_indexer import sparse_attn_indexer
 
 
@@ -384,7 +384,7 @@ class MonolithicDecoderLayer(nn.Module):
 
         from vllm.utils.flashinfer import flashinfer_scaled_fp4_mm
 
-        from .ops import silu_and_mul_nvfp4_quant
+        from .kernels import silu_and_mul_nvfp4_quant
 
         dp = shared_experts.down_proj
 

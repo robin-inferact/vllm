@@ -606,13 +606,6 @@ _SPECULATIVE_DECODING_MODELS = {
     # "MLPSpeculatorPreTrainedModel": ("mlp_speculator", "MLPSpeculator"),
 }
 
-if envs.VLLM_USE_SPECIALIZED_MODELS:
-    from vllm.model_executor.specialized_models import get_specialized_models
-
-    _specialized = get_specialized_models()
-    _TEXT_GENERATION_MODELS.update(_specialized)
-    _SPECULATIVE_DECODING_MODELS.update(_specialized)
-
 _TRANSFORMERS_SUPPORTED_MODELS = {
     # Text generation models
     "SmolLM3ForCausalLM": ("transformers", "TransformersForCausalLM"),
@@ -1309,16 +1302,21 @@ class _ModelRegistry:
 ModelRegistry = _ModelRegistry(
     {
         model_arch: _LazyRegisteredModel(
-            module_name=(
-                mod_relname
-                if mod_relname.startswith("vllm.")
-                else f"vllm.model_executor.models.{mod_relname}"
-            ),
+            module_name=f"vllm.model_executor.models.{mod_relname}",
             class_name=cls_name,
         )
         for model_arch, (mod_relname, cls_name) in _VLLM_MODELS.items()
     }
 )
+
+if envs.VLLM_USE_SPECIALIZED_MODELS:
+    from vllm.model_executor.specialized_models import get_specialized_models
+
+    for _arch, (_mod, _cls) in get_specialized_models().items():
+        ModelRegistry.models[_arch] = _LazyRegisteredModel(
+            module_name=_mod,
+            class_name=_cls,
+        )
 
 _T = TypeVar("_T")
 

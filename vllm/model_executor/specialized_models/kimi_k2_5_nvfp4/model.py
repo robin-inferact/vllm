@@ -105,6 +105,10 @@ def _kimi_mla_attn(
         output.zero_()
         return output
 
+    # ---- Calculate FP8 KV cache scales if needed ----
+    if mla.calculate_kv_scales:
+        mla.calc_kv_scales(q, kv_c_normed, k_pe)
+
     # ---- KV cache update (inlined do_kv_cache_update) ----
     kv_cache = mla.kv_cache
     if kv_cache.numel() > 0:
@@ -122,6 +126,12 @@ def _kimi_mla_attn(
             )
 
     # ---- Attention forward (inlined forward_impl) ----
+    # Lazy-init DCP world size (must happen before forward_mha/forward_mqa).
+    if mla.impl.dcp_world_size == -1:
+        from vllm.distributed.parallel_state import get_dcp_group
+
+        mla.impl.dcp_world_size = get_dcp_group().world_size
+
     # Trim to actual tokens (inputs may be padded for CUDA graphs).
     output_padded = output
     output = output[:num_actual_toks]
@@ -195,15 +205,11 @@ def _kimi_mla_attn(
             mqa_q_final = (mqa_ql_nope, mqa_q_pe)
 
         # Decode attention kernel
-        attn_out, _ = mla.impl.forward_mqa(
-            mqa_q_final, kv_cache, attn_metadata, mla
-        )
+        attn_out, _ = mla.impl.forward_mqa(mqa_q_final, kv_cache, attn_metadata, mla)
 
         # W_UV up-projection: (N, B, L) x (N, L, V) -> (N, B, V)
         x = attn_out.view(-1, mla.num_heads, mla.kv_lora_rank).transpose(0, 1)
-        out = output[:num_mqa_tokens].view(
-            -1, mla.num_heads, mla.v_head_dim
-        )
+        out = output[:num_mqa_tokens].view(-1, mla.num_heads, mla.v_head_dim)
         out = out.transpose(0, 1)
         torch.bmm(x, mla.W_UV, out=out)
 
@@ -222,7 +228,7 @@ def _kimi_mla_attn_fake(
 
 
 direct_register_custom_op(
-    op_name="kimi_mla_attn",
+    op_name="monolithic_attn",
     op_func=_kimi_mla_attn,
     fake_impl=_kimi_mla_attn_fake,
     mutates_args=["output"],
@@ -323,14 +329,14 @@ class KimiK25Nvfp4MLAAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv_a = torch.mm(hidden_states, self.fused_qkv_a_proj.weight.t())
+        qkv_a, _ = self.fused_qkv_a_proj(hidden_states)
         q_c, kv_lora = qkv_a.split(
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
             dim=-1,
         )
 
         q_c = self.q_a_layernorm(q_c)
-        q = torch.mm(q_c, self.q_b_proj.weight.t())
+        q, _ = self.q_b_proj(q_c)
 
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
@@ -347,8 +353,12 @@ class KimiK25Nvfp4MLAAttention(nn.Module):
             dtype=q.dtype,
             device=q.device,
         )
-        attn_out = torch.ops.vllm.kimi_mla_attn(
-            q, kv_c_normed, k_pe, output, mla.layer_name,
+        attn_out = torch.ops.vllm.monolithic_attn(
+            q,
+            kv_c_normed,
+            k_pe,
+            output,
+            mla.layer_name,
         )
         return self.o_proj(attn_out)[0]
 
@@ -564,8 +574,9 @@ class KimiK25Nvfp4TextForCausalLM(DeepseekV2ForCausalLM):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loaded = super().load_weights(weights)
-        for layer in self.model.layers:
-            layer.fuse_shared_expert_act_quant()
+        # TODO: re-enable after fixing inference correctness
+        # for layer in self.model.layers:
+        #     layer.fuse_shared_expert_act_quant()
         return loaded
 
 

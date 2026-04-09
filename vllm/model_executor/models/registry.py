@@ -67,22 +67,6 @@ from .interfaces_base import (
 
 logger = init_logger(__name__)
 
-_SPECIALIZED_TEXT_GENERATION_MODELS = {
-    "DeepseekV32ForCausalLM": (
-        "vllm.model_executor.specialized_models.deepseek_v3_2_nvfp4",
-        "DeepseekV32ForCausalLM",
-    ),
-}
-_SPECIALIZED_MTP_MODEL_ARCH_BY_BASE_ARCH = {
-    "DeepseekV32ForCausalLM": "_SpecializedDeepSeekV32MTPModel",
-}
-_SPECIALIZED_MTP_MODELS = {
-    "_SpecializedDeepSeekV32MTPModel": (
-        "vllm.model_executor.specialized_models.deepseek_v3_2_nvfp4",
-        "DeepSeekMTP",
-    ),
-}
-
 _TEXT_GENERATION_MODELS = {
     # [Decoder-only]
     "AfmoeForCausalLM": ("afmoe", "AfmoeForCausalLM"),
@@ -623,8 +607,11 @@ _SPECULATIVE_DECODING_MODELS = {
 }
 
 if envs.VLLM_USE_SPECIALIZED_MODELS:
-    _TEXT_GENERATION_MODELS.update(_SPECIALIZED_TEXT_GENERATION_MODELS)
-    _TEXT_GENERATION_MODELS.update(_SPECIALIZED_MTP_MODELS)
+    from vllm.model_executor.specialized_models import get_specialized_models
+
+    _specialized = get_specialized_models()
+    _TEXT_GENERATION_MODELS.update(_specialized)
+    _SPECULATIVE_DECODING_MODELS.update(_specialized)
 
 _TRANSFORMERS_SUPPORTED_MODELS = {
     # Text generation models
@@ -1103,16 +1090,6 @@ class _ModelRegistry:
         architecture: str,
         model_config: ModelConfig,
     ) -> str:
-        if architecture == "DeepSeekMTPModel" and envs.VLLM_USE_SPECIALIZED_MODELS:
-            base_arch = (
-                "DeepseekV32ForCausalLM"
-                if hasattr(model_config.hf_config, "index_topk")
-                else None
-            )
-            specialized_arch = _SPECIALIZED_MTP_MODEL_ARCH_BY_BASE_ARCH.get(base_arch)
-            if specialized_arch is not None:
-                return specialized_arch
-
         if architecture in self.models:
             return architecture
 

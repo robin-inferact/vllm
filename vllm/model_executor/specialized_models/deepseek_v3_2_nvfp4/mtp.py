@@ -43,6 +43,7 @@ class DeepSeekMultiTokenPredictorLayer(DeepSeekMultiTokenPredictorLayerBase):
     def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
         nn.Module.__init__(self)
 
+        assert vllm_config.speculative_config is not None
         config = vllm_config.speculative_config.draft_model_config.hf_config
         quant_config = vllm_config.quant_config
 

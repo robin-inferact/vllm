@@ -421,7 +421,7 @@ class DeepseekV32DecoderLayer(nn.Module):
             )
             return out
 
-        shared_experts.forward = _fused_forward
+        shared_experts.forward = _fused_forward  # type: ignore[method-assign]
 
 
 class DeepseekV32MLAAttention(nn.Module):

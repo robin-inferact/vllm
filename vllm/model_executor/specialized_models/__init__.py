@@ -24,6 +24,10 @@ _MODELS: dict[str, tuple[str, str]] = {
         "vllm.model_executor.specialized_models.deepseek_v3_2_nvfp4",
         "DeepseekV32ForCausalLM",
     ),
+    "KimiK25ForConditionalGeneration": (
+        "vllm.model_executor.specialized_models.kimi_k2_5_nvfp4",
+        "KimiK25ForConditionalGeneration",
+    ),
     "DeepSeekMTPModel": (
         "vllm.model_executor.specialized_models.deepseek_v3_2_nvfp4",
         "DeepSeekMTP",

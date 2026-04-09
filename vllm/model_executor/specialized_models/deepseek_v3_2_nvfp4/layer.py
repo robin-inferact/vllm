@@ -592,3 +592,25 @@ class DeepseekV32MLAAttention(nn.Module):
             use_sparse=True,
             indexer=self._indexer_proxy,
         )
+
+
+def remap_weight_name(name: str) -> str:
+    """Remap checkpoint names that differ from the module layout."""
+    replacements = [
+        (
+            "self_attn.q_a_layernorm.weight",
+            "attn.q_a_layernorm_weight",
+        ),
+        (
+            "self_attn.kv_a_layernorm.weight",
+            "attn.kv_a_layernorm_weight",
+        ),
+        ("self_attn.q_b_proj", "attn.q_b_proj"),
+        ("self_attn.kv_b_proj", "attn.kv_b_proj"),
+        ("self_attn.o_proj", "attn.o_proj"),
+        ("self_attn.indexer.", "attn.indexer_"),
+    ]
+    for old, new in replacements:
+        if old in name:
+            return name.replace(old, new)
+    return name

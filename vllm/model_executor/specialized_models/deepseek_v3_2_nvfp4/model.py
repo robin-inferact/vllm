@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-DeepSeek V3.2 model for SM100 (Blackwell).
-No PP, TP only, same checkpoint compatibility.
-"""
+"""DeepSeek V3.2 NVFP4 model for SM100 (Blackwell)."""
 
 from collections.abc import Iterable
 
@@ -22,15 +19,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.platforms import current_platform
 
-from .layer import DeepseekV32DecoderLayer
+from .layer import DeepseekV32DecoderLayer, remap_weight_name
 
 logger = init_logger(__name__)
 
 
 @support_torch_compile
 class DeepseekV32Model(nn.Module):
-    """Transformer backbone."""
-
     fall_back_to_pt_during_load = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -88,10 +83,6 @@ class DeepseekV32Model(nn.Module):
 
 
 class DeepseekV32ForCausalLM(nn.Module):
-    """
-    DeepSeek V3.2 CausalLM for SM100.
-    """
-
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
@@ -146,7 +137,7 @@ class DeepseekV32ForCausalLM(nn.Module):
 
         def _remap_weights():
             for name, w in weights:
-                yield self._remap(name), w
+                yield remap_weight_name(name), w
 
         self.use_mha = False
         self.fuse_qkv_a_proj = True
@@ -159,32 +150,3 @@ class DeepseekV32ForCausalLM(nn.Module):
             layer.fuse_shared_expert_act_quant()
 
         return loaded
-
-    def _remap(self, name: str) -> str:
-        """Remap only names that differ from original model structure."""
-        # Only remap layernorms and indexer (underscore prefix).
-        # Everything else (fused_qkv_a_proj, experts, gate, etc.) uses the
-        # same module paths as the original model.
-        return remap_weight_name(name)
-
-
-def remap_weight_name(name: str) -> str:
-    """Remap checkpoint names that differ from the module layout."""
-    replacements = [
-        (
-            "self_attn.q_a_layernorm.weight",
-            "attn.q_a_layernorm_weight",
-        ),
-        (
-            "self_attn.kv_a_layernorm.weight",
-            "attn.kv_a_layernorm_weight",
-        ),
-        ("self_attn.q_b_proj", "attn.q_b_proj"),
-        ("self_attn.kv_b_proj", "attn.kv_b_proj"),
-        ("self_attn.o_proj", "attn.o_proj"),
-        ("self_attn.indexer.", "attn.indexer_"),
-    ]
-    for old, new in replacements:
-        if old in name:
-            return name.replace(old, new)
-    return name

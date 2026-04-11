@@ -46,6 +46,9 @@ def create_parser():
     parser.set_defaults(
         model="ibm-research/PowerMoE-3b",
         enable_expert_parallel=True,
+        trust_remote_code=True,
+        max_model_len=2048,
+        # load_format='dummy',
     )
 
     # Add DP-specific args (separate from engine args to avoid conflicts)
@@ -76,7 +79,7 @@ def create_parser():
     parser.add_argument(
         "--timeout",
         type=int,
-        default=300,
+        default=600,
         help="Number of seconds before unresponsive process is killed.",
     )
 

@@ -227,10 +227,149 @@ def _kimi_mla_attn_fake(
     return output
 
 
+def _forked_kimi_mla_attn(
+    q: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    """Forked monolithic MLA attention for benchmark experimentation."""
+    mla: MLAAttention = get_forward_context().no_compile_layers[layer_name]
+
+    fwd_ctx = get_forward_context()
+    attn_metadata = fwd_ctx.attn_metadata
+    if isinstance(attn_metadata, dict):
+        attn_metadata = attn_metadata.get(layer_name)
+
+    if attn_metadata is None:
+        output.zero_()
+        return output
+
+    num_actual_toks = attn_metadata.num_actual_tokens
+    if num_actual_toks == 0:
+        output.zero_()
+        return output
+
+    if mla.calculate_kv_scales:
+        mla.calc_kv_scales(q, kv_c_normed, k_pe)
+
+    kv_cache = mla.kv_cache
+    if kv_cache.numel() > 0:
+        slot_mapping = fwd_ctx.slot_mapping
+        if isinstance(slot_mapping, dict):
+            slot_mapping = slot_mapping.get(layer_name)
+        if slot_mapping is not None:
+            ops.concat_and_cache_mla(
+                kv_c_normed,
+                k_pe.squeeze(1),
+                kv_cache,
+                slot_mapping.flatten(),
+                kv_cache_dtype=mla.kv_cache_dtype,
+                scale=mla._k_scale,
+            )
+
+    if mla.impl.dcp_world_size == -1:
+        from vllm.distributed.parallel_state import get_dcp_group
+
+        mla.impl.dcp_world_size = get_dcp_group().world_size
+
+    output_padded = output
+    output = output[:num_actual_toks]
+    q = q[:num_actual_toks]
+    kv_c_normed = kv_c_normed[:num_actual_toks]
+    k_pe = k_pe[:num_actual_toks]
+
+    fp8_attn = is_quantized_kv_cache(mla.kv_cache_dtype)
+    if fp8_attn and mla.kv_cache_dtype != "fp8_ds_mla":
+        kv_cache = kv_cache.view(current_platform.fp8_dtype())
+
+    assert (
+        attn_metadata.num_decodes is not None
+        and attn_metadata.num_prefills is not None
+        and attn_metadata.num_decode_tokens is not None
+    )
+    num_mqa_tokens = attn_metadata.num_decode_tokens
+    num_mha_tokens = q.size(0) - num_mqa_tokens
+
+    if num_mha_tokens > 0:
+        mla.impl.forward_mha(
+            q[num_mqa_tokens:],
+            kv_c_normed[num_mqa_tokens:],
+            k_pe[num_mqa_tokens:],
+            kv_cache,
+            attn_metadata,
+            mla._k_scale,
+            output=output[num_mqa_tokens:],
+        )
+
+    if num_mqa_tokens > 0:
+        mqa_q = q[:num_mqa_tokens]
+        mqa_q_nope, mqa_q_pe = mqa_q.split(
+            [mla.qk_nope_head_dim, mla.qk_rope_head_dim], dim=-1
+        )
+
+        mqa_q_nope = mqa_q_nope.transpose(0, 1)
+        N, B, P = mqa_q_nope.shape
+        _, _, L = mla.W_UK_T.shape
+
+        q_pad = mla.q_pad_num_heads
+        if q_pad is not None:
+            mqa_ql_nope = mqa_q_nope.new_empty((q_pad, B, L))
+            mqa_ql_nope.resize_((N, B, L))
+        else:
+            mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
+
+        torch.bmm(mqa_q_nope, mla.W_UK_T, out=mqa_ql_nope)
+        mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
+
+        if q_pad is not None:
+            B_pe, N_pe, L_pe = mqa_q_pe.shape
+            mqa_pe_padded = mqa_q_pe.new_empty((B_pe, q_pad, L_pe))
+            mqa_pe_padded.resize_((B_pe, N_pe, L_pe))
+            mqa_pe_padded.copy_(mqa_q_pe)
+            mqa_q_pe = mqa_pe_padded
+
+        if fp8_attn and mla.impl.supports_quant_query_input:
+            mqa_q_final = mla._decode_concat_quant_fp8_op(
+                mqa_ql_nope, mqa_q_pe, mla._q_scale
+            )
+        else:
+            mqa_q_final = (mqa_ql_nope, mqa_q_pe)
+
+        attn_out, _ = mla.impl.forward_mqa(mqa_q_final, kv_cache, attn_metadata, mla)
+
+        x = attn_out.view(-1, mla.num_heads, mla.kv_lora_rank).transpose(0, 1)
+        out = output[:num_mqa_tokens].view(-1, mla.num_heads, mla.v_head_dim)
+        out = out.transpose(0, 1)
+        torch.bmm(x, mla.W_UV, out=out)
+
+    return output_padded
+
+
+def _forked_kimi_mla_attn_fake(
+    q: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    del q, kv_c_normed, k_pe, layer_name
+    return output
+
+
 direct_register_custom_op(
     op_name="monolithic_attn",
     op_func=_kimi_mla_attn,
     fake_impl=_kimi_mla_attn_fake,
+    mutates_args=["output"],
+    dispatch_key=current_platform.dispatch_key,
+)
+
+direct_register_custom_op(
+    op_name="forked_monolithic_attn",
+    op_func=_forked_kimi_mla_attn,
+    fake_impl=_forked_kimi_mla_attn_fake,
     mutates_args=["output"],
     dispatch_key=current_platform.dispatch_key,
 )
@@ -354,6 +493,48 @@ class KimiK25Nvfp4MLAAttention(nn.Module):
             device=q.device,
         )
         attn_out = torch.ops.vllm.monolithic_attn(
+            q,
+            kv_c_normed,
+            k_pe,
+            output,
+            mla.layer_name,
+        )
+        return self.o_proj(attn_out)[0]
+
+
+class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
+    """Forked MLA path for kernel benchmarking experiments."""
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        qkv_a, _ = self.fused_qkv_a_proj(hidden_states)
+        q_c, kv_lora = qkv_a.split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+            dim=-1,
+        )
+
+        q_c = self.q_a_layernorm(q_c)
+        q, _ = self.q_b_proj(q_c)
+
+        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_c_normed = self.kv_a_layernorm(kv_c)
+
+        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
+        q_pe = q[..., self.qk_nope_head_dim :]
+        k_pe = k_pe.unsqueeze(1)
+        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        q[..., self.qk_nope_head_dim :] = q_pe
+
+        mla = self.mla_attn
+        output = torch.empty(
+            (hidden_states.shape[0], self.num_local_heads * self.v_head_dim),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        attn_out = torch.ops.vllm.forked_monolithic_attn(
             q,
             kv_c_normed,
             k_pe,

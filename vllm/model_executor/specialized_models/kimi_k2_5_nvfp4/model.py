@@ -502,6 +502,51 @@ class KimiK25Nvfp4MLAAttention(nn.Module):
         return self.o_proj(attn_out)[0]
 
 
+import cutlass
+import cutlass.cute as cute
+
+# requires:
+#  - not neox style
+#  - rotary dim = head size
+@cute.kernel
+def kimik25_rope_kernel(
+    positions: cute.Tensor, # (Sp, R)
+    query: cute.Tensor, # (2, Sp, N_local, R // 2)
+    key: cute.Tensor, # (2, Sp, 1, R // 2)
+    cos_sin_cache: cute.Tensor, # (R // 2, max_position_embeddings, 2)
+):
+    tid, _, _ = cute.arch.thread_idx()
+    bid, _, _ = cute.arch.block_idx()
+
+    cache_row = cos_sin_cache[tid, positions[bid]]
+    cos = cache_row[0]
+    sin = cache_row[1]
+    
+    for head in range(query.shape[2]):
+        query_slice = query[None, bid, head, tid]
+        a, b = query_slice.load()
+        a = a * cos - b * sin
+        b = a * sin + b * cos
+        query_slice.store([a, b])
+    key_slice = key[None, bid, 0, tid]
+    a, b = key_slice.load()
+    a = a * cos - b * sin
+    b = a * sin + b * cos
+    key_slice.store([a, b])
+
+@cute.jit
+def kimik25_rope(
+    positions: cute.Tensor, # (Sp, R)
+    query: cute.Tensor, # (Sp, N_local, R)
+    key: cute.Tensor, # (Sp, 1, R)
+    cos_sin_cache: cute.Tensor, # (max_position_embeddings, R)
+):
+    query = cute.logical_divide(query, cute.Shape((1, 1, 2)))
+    key = cute.logical_divide(key, cute.Shape((1, 1, 2)))
+    sp, _, R = query.shape
+    cos_sin_cache = cute.logical_divide(cos_sin_cache, cute.Shape(R // 2))
+    kimik25_rope_kernel(positions, query, key, cos_sin_cache).launch(grid=(sp, 1, 1), block=(R // 2, 1, 1))
+
 class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
     """Forked MLA path for kernel benchmarking experiments."""
 
@@ -525,7 +570,8 @@ class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)
         q_pe = q[..., self.qk_nope_head_dim :]
         k_pe = k_pe.unsqueeze(1)
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        # q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        kimik25_rope(positions, q_pe, k_pe, self.rotary_emb.cos_sin_cache)
         q[..., self.qk_nope_head_dim :] = q_pe
 
         mla = self.mla_attn

@@ -571,72 +571,59 @@ def kimik25_rmsnorm(
 
 
 @cute.kernel
-def kimik25_rmsnorm_special_qkv_split_kernel(
-    data: cute.Tensor, # (Sp, (lora_dim // k, k))
-    weights_q: cute.Tensor, # (lora_dim // k // 4 * 3, k)
-    weights_kv: cute.Tensor, # (lora_dim // k // 4, k)
-    lora_dim_q: cutlass.Constexpr,
+def kimik25_rmsnorm_special_qkv_fused_kernel(
+    data: cute.Tensor, # (Sp, (lora_dim_kv, 4))
+    weights_q: cute.Tensor, # (lora_dim_q,)
+    weights_kv: cute.Tensor, # (lora_dim_kv,)
+    lora_dim_q: cutlass.Constexpr, # must be lora_dim_kv * 3
     lora_dim_kv: cutlass.Constexpr,
     eps_q: cutlass.Constexpr,
     eps_kv: cutlass.Constexpr,
-    k: cutlass.Constexpr,
 ):
     total_lora_dim = lora_dim_q + lora_dim_kv
-    nwarps = total_lora_dim // (32 * k)
+    nwarps = total_lora_dim // 128
     allocator = cutlass.utils.SmemAllocator()
     sdata = allocator.allocate_tensor(cutlass.Float32,
-                                     layout=cute.make_layout(nwarps),
+                                     layout=cute.make_layout((nwarps, 2), stride=(1, nwarps)),
                                      byte_alignment=16,
                                      swizzle=None)
-    rsqrt_data = allocator.allocate_tensor(cutlass.Float32,
-                                           layout=cute.make_layout(2),
-                                           byte_alignment=16,
-                                           swizzle=None)
+    invnorms = allocator.allocate_tensor(cutlass.Float32, layout=cute.make_layout(2), byte_alignment=16, swizzle=None)
 
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
 
-    sum: cutlass.Float32 = 0.0
-    for i in cutlass.range_constexpr(k):
-        x = data[bid, (tid, i)].to(cutlass.Float32)
-        sum += x * x
-    sum = cute.arch.warp_reduction_sum(sum, threads_in_group=32)
+    x0 = data[bid, (tid, 0)].to(cutlass.Float32)
+    x1 = data[bid, (tid, 1)].to(cutlass.Float32)
+    x2 = data[bid, (tid, 2)].to(cutlass.Float32)
+    x3 = data[bid, (tid, 3)].to(cutlass.Float32)
+    a_sum = x0 * x0 + x1 * x1 + x2 * x2
+    b_sum = x3 * x3
+    
+    a_sum = cute.arch.warp_reduction_sum(a_sum, threads_in_group=32)
+    b_sum = cute.arch.warp_reduction_sum(b_sum, threads_in_group=32)
     if tid % 32 == 0:
-        sdata[tid // 32] = sum
+        sdata[tid // 32, 0] = a_sum
+        sdata[tid // 32, 1] = b_sum
+
     cute.arch.sync_threads()
     if tid < 32:
-        a_sum: cutlass.Float32 = 0.0
-        if tid < nwarps // 4 * 3:
-            a_sum = sdata[tid]
-        else:
-            a_sum = 0.0
-        a_sum = cute.arch.warp_reduction_sum(a_sum, threads_in_group=nwarps)
-        if tid == 0:
-            rsqrt_data[0] = cute.math.rsqrt(a_sum / lora_dim_q + eps_q)
-    elif tid < 64:
-        b_sum: cutlass.Float32 = 0.0
-        if tid < 32 + nwarps // 4:
-            b_sum = sdata[nwarps // 4 * 3 + tid - 32]
-        else:
-            b_sum == 0.0
-        b_sum = cute.arch.warp_reduction_sum(b_sum, threads_in_group=nwarps // 4)
-        if tid == 32:
-            rsqrt_data[1] = cute.math.rsqrt(b_sum / lora_dim_kv + eps_kv)
+        sum = sdata[tid]  # intended flat index
+        sum = cute.arch.warp_reduction_sum(sum, threads_in_group=nwarps)
+        if tid % nwarps == 0:
+            i = tid // nwarps
+            lora_dim = lora_dim_kv if i == 1 else lora_dim_q
+            eps = eps_kv if i == 1 else eps_q
+            invnorms[i] = cute.math.rsqrt(sum / lora_dim + eps)
+
     cute.arch.sync_threads()
-    if tid < lora_dim_kv:
-        invnorm = sdata[0]
-        for i in cutlass.range_constexpr(k):
-            y = data[bid, (tid, i)].to(cutlass.Float32)
-            data[bid, (tid, i)] = (y * invnorm).to(cutlass.BFloat16) * weights_q[tid, i]
-    else:
-        invnorm = sdata[1]
-        for i in cutlass.range_constexpr(k):
-            index = tid - lora_dim_kv
-            y = data[bid, (index, i)].to(cutlass.Float32)
-            data[bid, (index, i)] = (y * invnorm).to(cutlass.BFloat16) * weights_kv[index, i]
+    invnorm_q, invnorm_kv = invnorms[0], invnorms[1]
+    data[bid, (tid, 0)] = (x0 * invnorm_q).to(cutlass.BFloat16) * weights_q[tid]
+    data[bid, (tid, 1)] = (x1 * invnorm_q).to(cutlass.BFloat16) * weights_q[tid + lora_dim_kv]
+    data[bid, (tid, 2)] = (x2 * invnorm_q).to(cutlass.BFloat16) * weights_q[tid + lora_dim_kv * 2]
+    data[bid, (tid, 3)] = (x3 * invnorm_kv).to(cutlass.BFloat16) * weights_kv[tid]
 
 @cute.jit
-def kimik25_rmsnorm_special_qkv_split(
+def kimik25_rmsnorm_special_qkv_fused(
     data: cute.Tensor,
     weights_q: cute.Tensor,
     weights_kv: cute.Tensor,
@@ -644,28 +631,18 @@ def kimik25_rmsnorm_special_qkv_split(
     lora_dim_kv: cutlass.Constexpr,
     eps_q: cutlass.Constexpr,
     eps_kv: cutlass.Constexpr,
-    k: cutlass.Constexpr,
     stream: CUstream
 ):
     assert lora_dim_q == lora_dim_kv * 3
     total_lora_dim = lora_dim_q + lora_dim_kv
-    assert total_lora_dim % (128 * k) == 0
-    assert total_lora_dim // (128 * k) in [1, 2, 4, 8]
+    assert total_lora_dim == 2048
     data = cute.make_tensor(
         data.iterator,
-        cute.make_layout((data.shape[0], (total_lora_dim // k, k)), stride=(data.stride[0], (1, total_lora_dim // k)))
-    )
-    weights_q = cute.make_tensor(
-        weights_q.iterator,
-        cute.make_layout((lora_dim_q // k, k), stride=(1, lora_dim_q // k))
-    )
-    weights_kv = cute.make_tensor(
-        weights_kv.iterator,
-        cute.make_layout((lora_dim_kv // k, k), stride=(1, lora_dim_kv // k))
+        cute.make_layout((data.shape[0], (lora_dim_kv, 4)), stride=(data.stride[0], (1, lora_dim_kv)))
     )
     grid = (data.shape[0], 1, 1)
-    block = (total_lora_dim // k, 1, 1)
-    kimik25_rmsnorm_special_qkv_split_kernel(data, weights_q, weights_kv, lora_dim_q, lora_dim_kv, eps_q, eps_kv, k).launch(grid=grid, block=block, stream=stream)
+    block = (lora_dim_kv, 1, 1)
+    kimik25_rmsnorm_special_qkv_fused_kernel(data, weights_q, weights_kv, lora_dim_q, lora_dim_kv, eps_q, eps_kv).launch(grid=grid, block=block, stream=stream)
 
 
 
@@ -734,7 +711,7 @@ class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
         qkv_c_cute = from_dlpack(qkv_c).mark_layout_dynamic()
         q_c_layernorm_weights_cute = from_dlpack(self.q_a_layernorm.weight.detach())
         kv_c_layernorm_weights_cute = from_dlpack(self.kv_a_layernorm.weight.detach())
-        kimik25_rmsnorm_special_qkv_split(
+        kimik25_rmsnorm_special_qkv_fused(
             data=qkv_c_cute,
             weights_q=q_c_layernorm_weights_cute,
             weights_kv=kv_c_layernorm_weights_cute,
@@ -742,7 +719,6 @@ class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
             lora_dim_kv=self.kv_a_layernorm.hidden_size,
             eps_q=self.q_a_layernorm.variance_epsilon,
             eps_kv=self.kv_a_layernorm.variance_epsilon,
-            k=2,
             stream=cutlass.torch.current_stream())
 
         q_c, kv_c = qkv_c.split([self.q_lora_rank, self.kv_lora_rank], dim=-1)

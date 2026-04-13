@@ -255,7 +255,7 @@ def _initialize_random_weights(module: torch.nn.Module) -> None:
             if param.ndim >= 2:
                 param.normal_(mean=0.0, std=0.02)
             elif "layernorm" in name.lower() or "norm" in name.lower():
-                param.fill_(1.0)
+                param.normal_(mean=1.0, std=0.1)
             else:
                 param.zero_()
 

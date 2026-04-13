@@ -571,6 +571,105 @@ def kimik25_rmsnorm(
 
 
 @cute.kernel
+def kimik25_rmsnorm_special_qkv_split_kernel(
+    data: cute.Tensor, # (Sp, (lora_dim // k, k))
+    weights_q: cute.Tensor, # (lora_dim // k // 4 * 3, k)
+    weights_kv: cute.Tensor, # (lora_dim // k // 4, k)
+    lora_dim_q: cutlass.Constexpr,
+    lora_dim_kv: cutlass.Constexpr,
+    eps_q: cutlass.Constexpr,
+    eps_kv: cutlass.Constexpr,
+    k: cutlass.Constexpr,
+):
+    total_lora_dim = lora_dim_q + lora_dim_kv
+    nwarps = total_lora_dim // (32 * k)
+    allocator = cutlass.utils.SmemAllocator()
+    sdata = allocator.allocate_tensor(cutlass.Float32,
+                                     layout=cute.make_layout(nwarps),
+                                     byte_alignment=16,
+                                     swizzle=None)
+    rsqrt_data = allocator.allocate_tensor(cutlass.Float32,
+                                           layout=cute.make_layout(2),
+                                           byte_alignment=16,
+                                           swizzle=None)
+
+    tid, _, _ = cute.arch.thread_idx()
+    bid, _, _ = cute.arch.block_idx()
+
+    sum: cutlass.Float32 = 0.0
+    for i in cutlass.range_constexpr(k):
+        x = data[bid, (tid, i)].to(cutlass.Float32)
+        sum += x * x
+    sum = cute.arch.warp_reduction_sum(sum, threads_in_group=32)
+    if tid % 32 == 0:
+        sdata[tid // 32] = sum
+    cute.arch.sync_threads()
+    if tid < 32:
+        a_sum: cutlass.Float32 = 0.0
+        if tid < nwarps // 4 * 3:
+            a_sum = sdata[tid]
+        else:
+            a_sum = 0.0
+        a_sum = cute.arch.warp_reduction_sum(a_sum, threads_in_group=nwarps)
+        if tid == 0:
+            rsqrt_data[0] = cute.math.rsqrt(a_sum / lora_dim_q + eps_q)
+    elif tid < 64:
+        b_sum: cutlass.Float32 = 0.0
+        if tid < 32 + nwarps // 4:
+            b_sum = sdata[nwarps // 4 * 3 + tid - 32]
+        else:
+            b_sum == 0.0
+        b_sum = cute.arch.warp_reduction_sum(b_sum, threads_in_group=nwarps // 4)
+        if tid == 32:
+            rsqrt_data[1] = cute.math.rsqrt(b_sum / lora_dim_kv + eps_kv)
+    cute.arch.sync_threads()
+    if tid < lora_dim_kv:
+        invnorm = sdata[0]
+        for i in cutlass.range_constexpr(k):
+            y = data[bid, (tid, i)].to(cutlass.Float32)
+            data[bid, (tid, i)] = (y * invnorm).to(cutlass.BFloat16) * weights_q[tid, i]
+    else:
+        invnorm = sdata[1]
+        for i in cutlass.range_constexpr(k):
+            index = tid - lora_dim_kv
+            y = data[bid, (index, i)].to(cutlass.Float32)
+            data[bid, (index, i)] = (y * invnorm).to(cutlass.BFloat16) * weights_kv[index, i]
+
+@cute.jit
+def kimik25_rmsnorm_special_qkv_split(
+    data: cute.Tensor,
+    weights_q: cute.Tensor,
+    weights_kv: cute.Tensor,
+    lora_dim_q: cutlass.Constexpr,
+    lora_dim_kv: cutlass.Constexpr,
+    eps_q: cutlass.Constexpr,
+    eps_kv: cutlass.Constexpr,
+    k: cutlass.Constexpr,
+    stream: CUstream
+):
+    assert lora_dim_q == lora_dim_kv * 3
+    total_lora_dim = lora_dim_q + lora_dim_kv
+    assert total_lora_dim % (128 * k) == 0
+    assert total_lora_dim // (128 * k) in [1, 2, 4, 8]
+    data = cute.make_tensor(
+        data.iterator,
+        cute.make_layout((data.shape[0], (total_lora_dim // k, k)), stride=(data.stride[0], (1, total_lora_dim // k)))
+    )
+    weights_q = cute.make_tensor(
+        weights_q.iterator,
+        cute.make_layout((lora_dim_q // k, k), stride=(1, lora_dim_q // k))
+    )
+    weights_kv = cute.make_tensor(
+        weights_kv.iterator,
+        cute.make_layout((lora_dim_kv // k, k), stride=(1, lora_dim_kv // k))
+    )
+    grid = (data.shape[0], 1, 1)
+    block = (total_lora_dim // k, 1, 1)
+    kimik25_rmsnorm_special_qkv_split_kernel(data, weights_q, weights_kv, lora_dim_q, lora_dim_kv, eps_q, eps_kv, k).launch(grid=grid, block=block, stream=stream)
+
+
+
+@cute.kernel
 def kimik25_rope_kernel(
     positions: cute.Tensor, # (Sp,)
     query: cute.Tensor, # (Sp, N_local, (2, R // 2))
@@ -620,27 +719,33 @@ def kimik25_rope(
 class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
     """Forked MLA path for kernel benchmarking experiments."""
 
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv_a, _ = self.fused_qkv_a_proj(hidden_states)
-        q_c, kv_lora = qkv_a.split(
-            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+        qkv_c, k_pe = qkv_a.split(
+            [self.q_lora_rank + self.kv_lora_rank, self.qk_rope_head_dim],
             dim=-1,
         )
 
-        q_c_cute = from_dlpack(q_c).mark_layout_dynamic()
+        qkv_c_cute = from_dlpack(qkv_c).mark_layout_dynamic()
         q_c_layernorm_weights_cute = from_dlpack(self.q_a_layernorm.weight.detach())
-        kimik25_rmsnorm(q_c_cute, q_c_layernorm_weights_cute, self.q_a_layernorm.hidden_size, self.q_a_layernorm.variance_epsilon, 3, cutlass.torch.current_stream())
-
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        # kv_c_normed = self.kv_a_layernorm(kv_c)
-        kv_c_cute = from_dlpack(kv_c).mark_layout_dynamic()
         kv_c_layernorm_weights_cute = from_dlpack(self.kv_a_layernorm.weight.detach())
-        kimik25_rmsnorm(kv_c_cute, kv_c_layernorm_weights_cute, self.kv_a_layernorm.hidden_size, self.kv_a_layernorm.variance_epsilon, 1, cutlass.torch.current_stream())
+        kimik25_rmsnorm_special_qkv_split(
+            data=qkv_c_cute,
+            weights_q=q_c_layernorm_weights_cute,
+            weights_kv=kv_c_layernorm_weights_cute,
+            lora_dim_q=self.q_a_layernorm.hidden_size,
+            lora_dim_kv=self.kv_a_layernorm.hidden_size,
+            eps_q=self.q_a_layernorm.variance_epsilon,
+            eps_kv=self.kv_a_layernorm.variance_epsilon,
+            k=2,
+            stream=cutlass.torch.current_stream())
 
+        q_c, kv_c = qkv_c.split([self.q_lora_rank, self.kv_lora_rank], dim=-1)
         q, _ = self.q_b_proj(q_c)
 
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)

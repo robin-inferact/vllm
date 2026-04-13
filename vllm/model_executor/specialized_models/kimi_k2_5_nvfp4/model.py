@@ -503,11 +503,73 @@ class KimiK25Nvfp4MLAAttention(nn.Module):
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack, make_ptr
-import cuda.bindings.driver as cuda
+from cuda.bindings.driver import CUstream
 
-# requires:
-#  - not neox style
-#  - rotary dim = head size
+@cute.kernel
+def kimik25_rmsnorm_kernel(
+    data: cute.Tensor, # (Sp, (lora_dim // k, k))
+    weights: cute.Tensor, # (lora_dim // k, k)
+    lora_dim: cutlass.Constexpr,
+    eps: cutlass.Constexpr,
+    k: cutlass.Constexpr,
+):
+    assert lora_dim % k == 0
+    assert lora_dim // k // 32 in [1, 2, 4, 8, 16, 32]
+    allocator = cutlass.utils.SmemAllocator()
+    sdata = allocator.allocate_tensor(cutlass.Float32,
+                                     layout=cute.make_layout((lora_dim // k // 32,)),
+                                     byte_alignment=16,
+                                     swizzle=None)
+
+    tid, _, _ = cute.arch.thread_idx()
+    bid, _, _ = cute.arch.block_idx()
+
+
+    sum: cutlass.Float32 = 0.0
+    for i in cutlass.range_constexpr(k):
+        x = data[bid, (tid, i)].to(cutlass.Float32)
+        sum += x * x
+    sum = cute.arch.warp_reduction_sum(sum, threads_in_group=32)
+    if tid % 32 == 0:
+        sdata[tid // 32] = sum
+    cute.arch.sync_threads()
+    if tid < 32:
+        if tid < lora_dim // k // 32:
+            sum = sdata[tid]
+        else:
+            sum = 0.0
+        sum = cute.arch.warp_reduction_sum(sum, threads_in_group=lora_dim // k // 32)
+        if tid == 0:
+            sdata[0] = cute.math.rsqrt(sum / lora_dim + eps)
+    cute.arch.sync_threads()
+    invnorm = sdata[0]
+    for i in cutlass.range_constexpr(k):
+        x = data[bid, (tid, i)].to(cutlass.Float32)
+        x = (x * invnorm).to(cutlass.BFloat16) * weights[tid, i]
+        data[bid, (tid, i)] = x
+
+@cute.jit
+def kimik25_rmsnorm(
+    data: cute.Tensor,
+    weights: cute.Tensor,
+    lora_dim: cutlass.Constexpr,
+    eps: cutlass.Constexpr,
+    k: cutlass.Constexpr,
+    stream: CUstream
+):
+    data = cute.make_tensor(
+        data.iterator,
+        cute.make_layout((data.shape[0], (lora_dim // k, k)), stride=(data.stride[0], (1, lora_dim // k)))
+    )
+    weights = cute.make_tensor(
+        weights.iterator,
+        cute.make_layout((lora_dim // k, k), stride=(1, lora_dim // k))
+    )
+    grid = (data.shape[0], 1, 1)
+    block = (lora_dim // k, 1, 1)
+    kimik25_rmsnorm_kernel(data, weights, lora_dim, eps, k).launch(grid=grid, block=block, stream=stream)
+
+
 @cute.kernel
 def kimik25_rope_kernel(
     positions: cute.Tensor, # (Sp,)
@@ -544,7 +606,7 @@ def kimik25_rope(
     cos_sin_cache: cute.Tensor, # (max_position_embeddings, R)
     N_local: cutlass.Constexpr,
     half_rope_dim: cutlass.Constexpr,
-    stream: cuda.CUstream
+    stream: CUstream
 ):
     sp = positions.shape[0]
     query = cute.make_tensor(
@@ -569,7 +631,9 @@ class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
             dim=-1,
         )
 
-        q_c = self.q_a_layernorm(q_c)
+        q_c_cute = from_dlpack(q_c).mark_layout_dynamic()
+        q_c_layernorm_weights_cute = from_dlpack(self.q_a_layernorm.weight.detach())
+        kimik25_rmsnorm(q_c_cute, q_c_layernorm_weights_cute, self.q_a_layernorm.hidden_size, self.q_a_layernorm.variance_epsilon, 3, cutlass.torch.current_stream())
         q, _ = self.q_b_proj(q_c)
 
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)

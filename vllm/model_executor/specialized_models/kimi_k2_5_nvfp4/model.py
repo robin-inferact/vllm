@@ -634,10 +634,14 @@ class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
         q_c_cute = from_dlpack(q_c).mark_layout_dynamic()
         q_c_layernorm_weights_cute = from_dlpack(self.q_a_layernorm.weight.detach())
         kimik25_rmsnorm(q_c_cute, q_c_layernorm_weights_cute, self.q_a_layernorm.hidden_size, self.q_a_layernorm.variance_epsilon, 3, cutlass.torch.current_stream())
-        q, _ = self.q_b_proj(q_c)
 
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_c_normed = self.kv_a_layernorm(kv_c)
+        # kv_c_normed = self.kv_a_layernorm(kv_c)
+        kv_c_cute = from_dlpack(kv_c).mark_layout_dynamic()
+        kv_c_layernorm_weights_cute = from_dlpack(self.kv_a_layernorm.weight.detach())
+        kimik25_rmsnorm(kv_c_cute, kv_c_layernorm_weights_cute, self.kv_a_layernorm.hidden_size, self.kv_a_layernorm.variance_epsilon, 1, cutlass.torch.current_stream())
+
+        q, _ = self.q_b_proj(q_c)
 
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)
         q_pe = q[..., self.qk_nope_head_dim :]
@@ -659,7 +663,7 @@ class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
         )
         attn_out = torch.ops.vllm.forked_monolithic_attn(
             q,
-            kv_c_normed,
+            kv_c,
             k_pe,
             output,
             mla.layer_name,

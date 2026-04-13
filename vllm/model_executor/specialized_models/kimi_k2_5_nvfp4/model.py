@@ -503,6 +503,7 @@ class KimiK25Nvfp4MLAAttention(nn.Module):
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack, make_ptr
+import cuda.bindings.driver as cuda
 
 # requires:
 #  - not neox style
@@ -515,26 +516,25 @@ def kimik25_rope_kernel(
     cos_sin_cache: cute.Tensor, # (max_position_embeddings, (R // 2, 2))
 ):
     tid, _, _ = cute.arch.thread_idx()
-    bid, _, _ = cute.arch.block_idx()
+    bidx, bidy, _ = cute.arch.block_idx()
 
-    cache_row = cos_sin_cache[positions[bid], (tid, None)]
+    cache_row = cos_sin_cache[positions[bidx], (tid, None)]
     cos, sin = cache_row[0], cache_row[1]
     
-    for head in range(query.shape[1]):
-        query_slice = query[bid, head, (None, tid)]
-        v = query_slice.load()
-        a, b = v[0], v[1]
+    if bidy < query.shape[1]:
+        query_slice = query[bidx, bidy, (None, tid)]
+        a, b = query_slice[0], query_slice[1]
         a_new = a * cos - b * sin
         b_new = a * sin + b * cos
         query_slice[0] = a_new
         query_slice[1] = b_new
-    key_slice = key[bid, 0, (None, tid)]
-    v = key_slice.load()
-    a, b = v[0], v[1]
-    a_new = a * cos - b * sin
-    b_new = a * sin + b * cos
-    key_slice[0] = a_new
-    key_slice[1] = b_new
+    else:
+        key_slice = key[bidx, 0, (None, tid)]
+        a, b = key_slice[0], key_slice[1]
+        a_new = a * cos - b * sin
+        b_new = a * sin + b * cos
+        key_slice[0] = a_new
+        key_slice[1] = b_new
 
 @cute.jit
 def kimik25_rope(
@@ -543,7 +543,8 @@ def kimik25_rope(
     key: cute.Tensor, # (Sp, 1, R)
     cos_sin_cache: cute.Tensor, # (max_position_embeddings, R)
     N_local: cutlass.Constexpr,
-    half_rope_dim: cutlass.Constexpr
+    half_rope_dim: cutlass.Constexpr,
+    stream: cuda.CUstream
 ):
     sp = positions.shape[0]
     query = cute.make_tensor(
@@ -552,7 +553,7 @@ def kimik25_rope(
     )
     key = cute.logical_divide(key, (1, 1, 2))[(0, None), (0, None), None]
     cos_sin_cache = cute.logical_divide(cos_sin_cache, (1, half_rope_dim))[(0, None), None]
-    kimik25_rope_kernel(positions, query, key, cos_sin_cache).launch(grid=(sp, 1, 1), block=(half_rope_dim, 1, 1))
+    kimik25_rope_kernel(positions, query, key, cos_sin_cache).launch(grid=(sp, N_local + 1, 1), block=(half_rope_dim, 1, 1), stream=stream)
 
 class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
     """Forked MLA path for kernel benchmarking experiments."""
@@ -584,8 +585,7 @@ class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
         q_pe_cute = from_dlpack(q_pe).mark_layout_dynamic()
         k_pe_cute = from_dlpack(k_pe)
         cos_sin_cache_cute = from_dlpack(self.rotary_emb.cos_sin_cache)
-        kimik25_rope(positions_cute, q_pe_cute, k_pe_cute, cos_sin_cache_cute, self.num_local_heads, self.qk_rope_head_dim // 2)
-        q[..., self.qk_nope_head_dim :] = q_pe
+        kimik25_rope(positions_cute, q_pe_cute, k_pe_cute, cos_sin_cache_cute, self.num_local_heads, self.qk_rope_head_dim // 2, cutlass.torch.current_stream())
 
         mla = self.mla_attn
         output = torch.empty(

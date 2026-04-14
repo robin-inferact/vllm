@@ -760,29 +760,46 @@ def _build_cutedsl_version() -> KernelVersion:
     @cute.kernel
     def kimik25_rope_kernel(
         positions: cute.Tensor,  # (Sp,)
-        query: cute.Tensor,  # (Sp, N_local, (2, R // 2))
+        query: cute.Tensor,  # (Sp, (K, N_local // K), (2, R // 2))
         key: cute.Tensor,  # (Sp, 1, (2, R // 2))
-        cos_sin_cache: cute.Tensor,  # (max_position_embeddings, (R // 2, 2))
+        cos_sin_cache: cute.Tensor,  # (max_position_embeddings, R)
+        half_rope_dim: cutlass.Constexpr,
     ):
-        tid, _, _ = cute.arch.thread_idx()
-        bidx, bidy, _ = cute.arch.block_idx()
+        allocator = cutlass.utils.SmemAllocator()
+        sdata = allocator.allocate_tensor(
+            cutlass.BFloat16,
+            layout=cute.make_layout((2, half_rope_dim)),
+            byte_alignment=16,
+            swizzle=None,
+        )
         result = cute.make_rmem_tensor_like(query[0, 0, (None, 0)])
 
-        cache_row = cos_sin_cache[positions[bidx], (tid, None)]
-        cos, sin = cache_row[0], cache_row[1]
+        tidx, tidy, _ = cute.arch.thread_idx()
+        bidx, bidy, _ = cute.arch.block_idx()
 
-        if bidy < query.shape[1]:
-            query_slice = query[bidx, bidy, (None, tid)].load()
+        if tidy == 0:
+            pos = positions[bidx]
+            if bidy > 0:
+                cos_sin_cache_tiles = cute.logical_divide(cos_sin_cache, (1, 2))[
+                    (0, None), None
+                ]
+                cute.autovec_copy(cos_sin_cache_tiles[pos, (None, tidx)], sdata[None, tidx])
+            else:
+                cos, sin = cos_sin_cache[pos, tidx], cos_sin_cache[pos, tidx + 32]
+                key_slice = key[bidx, 0, (None, tidx)].load()
+                a, b = key_slice[0], key_slice[1]
+                result[0] = a * cos - b * sin
+                result[1] = a * sin + b * cos
+                key[bidx, 0, (None, tidx)].store(result.load())
+
+        if bidy > 0:
+            cute.arch.sync_threads()
+            cos, sin = sdata[tidx], sdata[tidx + 32]
+            query_slice = query[bidx, (tidy, bidy - 1), (None, tidx)].load()
             a, b = query_slice[0], query_slice[1]
             result[0] = a * cos - b * sin
             result[1] = a * sin + b * cos
-            query[bidx, bidy, (None, tid)].store(result.load())
-        else:
-            key_slice = key[bidx, 0, (None, tid)].load()
-            a, b = key_slice[0], key_slice[1]
-            result[0] = a * cos - b * sin
-            result[1] = a * sin + b * cos
-            key[bidx, 0, (None, tid)].store(result.load())
+            query[bidx, (tidy, bidy - 1), (None, tidx)].store(result.load())
 
     @cute.jit
     def kimik25_rope(
@@ -794,21 +811,20 @@ def _build_cutedsl_version() -> KernelVersion:
         half_rope_dim: cutlass.Constexpr,
         stream: CUstream,
     ):
+        K: cutlass.Constexpr = 4
+        assert N_local % K == 0
         sp = positions.shape[0]
         query = cute.make_tensor(
             query.iterator,
             cute.make_layout(
-                (sp, N_local, (2, half_rope_dim)),
-                stride=(cute.assume(query.stride[0], divby=2), cute.assume(query.stride[1], divby=2), (1, 2)),
+                (sp, (K, N_local // K), (2, half_rope_dim)),
+                stride=(cute.assume(query.stride[0], divby=2), (cute.assume(query.stride[1], divby=2), query.stride[1] * K), (1, 2)),
             ),
         )
         key = cute.logical_divide(key, (1, 1, 2))[(0, None), (0, None), None]
-        cos_sin_cache = cute.logical_divide(cos_sin_cache, (1, half_rope_dim))[
-            (0, None), None
-        ]
-        kimik25_rope_kernel(positions, query, key, cos_sin_cache).launch(
-            grid=(sp, N_local + 1, 1),
-            block=(half_rope_dim, 1, 1),
+        kimik25_rope_kernel(positions, query, key, cos_sin_cache, half_rope_dim).launch(
+            grid=(sp, N_local // K + 1, 1),
+            block=(half_rope_dim, K, 1),
             stream=stream,
         )
 

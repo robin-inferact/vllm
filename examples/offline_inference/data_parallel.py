@@ -44,10 +44,11 @@ def create_parser():
     # Add all engine args
     EngineArgs.add_cli_args(parser)
     parser.set_defaults(
-        model="ibm-research/PowerMoE-3b",
-        enable_expert_parallel=True,
+        model="nvidia/Kimi-K2.5-NVFP4",
+        enable_expert_parallel=False,
         trust_remote_code=True,
         max_model_len=2048,
+        tensor_parallel_size=4,
         # load_format='dummy',
     )
 
@@ -79,7 +80,7 @@ def create_parser():
     parser.add_argument(
         "--timeout",
         type=int,
-        default=600,
+        default=6000,
         help="Number of seconds before unresponsive process is killed.",
     )
 

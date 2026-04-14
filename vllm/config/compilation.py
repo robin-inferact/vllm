@@ -750,6 +750,7 @@ class CompilationConfig:
         "vllm::rocm_aiter_sparse_attn_indexer",
         # For specialized models
         "vllm::monolithic_attn",
+        "vllm::forked_monolithic_attn",
     ]
 
     def compute_hash(self) -> str:

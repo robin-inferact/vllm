@@ -49,7 +49,7 @@ def create_parser():
         trust_remote_code=True,
         max_model_len=2048,
         tensor_parallel_size=4,
-        # load_format='dummy',
+        load_format='dummy',
     )
 
     # Add DP-specific args (separate from engine args to avoid conflicts)

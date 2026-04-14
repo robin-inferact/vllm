@@ -400,6 +400,9 @@ def _build_cutedsl_version() -> KernelVersion:
             x0 = data[bid, (None, tid, 0)].load().to(cutlass.Float32)
             x1 = data[bid, (None, tid, 1)].load().to(cutlass.Float32)
             x2 = data[bid, (None, tid, 2)].load().to(cutlass.Float32)
+            w0 = weights_q[None, tid].load()
+            w1 = weights_q[None, tid + lora_dim_kv // 2].load()
+            w2 = weights_q[None, tid + lora_dim_kv].load()
             sum = x0 * x0 + x1 * x1 + x2 * x2
             sum = sum[0] + sum[1]
 
@@ -414,21 +417,16 @@ def _build_cutedsl_version() -> KernelVersion:
 
             ssum = cute.arch.warp_reduction_sum(ssum, threads_in_group=nwarps)
             if tid == 0:
-                sdata[0] = cute.math.rsqrt(ssum * (1.0 / lora_dim_q) + eps_q)
+                sdata[0] = cute.math.rsqrt(ssum / lora_dim_q + eps_q)
 
             cute.arch.sync_threads()
             invnorm = sdata[0]
-            data[bid, (None, tid, 0)] = (
-                x0 * invnorm
-            ).to(cutlass.BFloat16) * weights_q[None, tid].load()
-            data[bid, (None, tid, 1)] = (
-                x1 * invnorm
-            ).to(cutlass.BFloat16) * weights_q[None, tid + lora_dim_kv // 2].load()
-            data[bid, (None, tid, 2)] = (
-                x2 * invnorm
-            ).to(cutlass.BFloat16) * weights_q[None, tid + lora_dim_kv].load()
+            data[bid, (None, tid, 0)] = (x0 * invnorm).to(cutlass.BFloat16) * w0
+            data[bid, (None, tid, 1)] = (x1 * invnorm).to(cutlass.BFloat16) * w1
+            data[bid, (None, tid, 2)] = (x2 * invnorm).to(cutlass.BFloat16) * w2
         else:
             x3 = data[bid - Sp, (None, tid, 3)].load().to(cutlass.Float32)
+            w3 = weights_kv[None, tid].load()
             sum = x3 * x3
             sum = sum[0] + sum[1]
 
@@ -447,9 +445,7 @@ def _build_cutedsl_version() -> KernelVersion:
 
             cute.arch.sync_threads()
             invnorm = sdata[0]
-            data[bid - Sp, (None, tid, 3)] = (
-                x3 * invnorm
-            ).to(cutlass.BFloat16) * weights_kv[None, tid].load()
+            data[bid - Sp, (None, tid, 3)] = (x3 * invnorm).to(cutlass.BFloat16) * w3
 
     @cute.jit
     def kimik25_rmsnorm_special_qkv_fused(

@@ -16,6 +16,9 @@ The linear layers are initialized with random dense weights instead of loading
 the checkpoint's NVFP4 tensors. This keeps the benchmark lightweight while
 preserving the real module dimensions, cache layout, metadata builder, and
 decode execution path.
+
+For multi-GPU tensor-parallel benchmarking, launch this script with `torchrun`
+and set `--tensor-parallel-size` to match `WORLD_SIZE`.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 
 from vllm.config import (
     CUDAGraphMode,
@@ -44,6 +48,7 @@ from vllm.config import (
 from vllm.distributed import (
     cleanup_dist_env_and_memory,
     graph_capture,
+    get_tensor_model_parallel_world_size,
     init_distributed_environment,
     initialize_model_parallel,
     model_parallel_is_initialized,
@@ -154,6 +159,15 @@ def _parse_args() -> argparse.Namespace:
             "the forked kernel, or both."
         ),
     )
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help=(
+            "Tensor parallel world size for the benchmark. "
+            "Use torchrun and match WORLD_SIZE when this is > 1."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -166,6 +180,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-seq-len must be >= --min-seq-len.")
     if args.block_size <= 0:
         raise ValueError("--block-size must be positive.")
+    if args.tensor_parallel_size <= 0:
+        raise ValueError("--tensor-parallel-size must be positive.")
     if args.warmup < 0 or args.trials <= 0:
         raise ValueError("--warmup must be >= 0 and --trials must be > 0.")
     if not current_platform.is_cuda():
@@ -195,7 +211,9 @@ def _build_vllm_config(args: argparse.Namespace) -> VllmConfig:
         is_encoder_decoder=False,
         enable_chunked_prefill=True,
     )
-    parallel_config = ParallelConfig(tensor_parallel_size=1)
+    parallel_config = ParallelConfig(
+        tensor_parallel_size=args.tensor_parallel_size
+    )
     compilation_config = CompilationConfig()
 
     top_level_config = VllmConfig(
@@ -209,37 +227,129 @@ def _build_vllm_config(args: argparse.Namespace) -> VllmConfig:
     return top_level_config.with_hf_config(model_config.hf_text_config)
 
 
+@dataclass(frozen=True)
+class DistributedRuntime:
+    rank: int
+    world_size: int
+    local_rank: int
+
+    @property
+    def is_primary(self) -> bool:
+        return self.rank == 0
+
+
+def _get_distributed_runtime(args: argparse.Namespace) -> DistributedRuntime:
+    env_values = {
+        name: os.environ.get(name) for name in ("RANK", "WORLD_SIZE", "LOCAL_RANK")
+    }
+    has_launch_env = any(value is not None for value in env_values.values())
+
+    if has_launch_env:
+        missing = [name for name, value in env_values.items() if value is None]
+        if missing:
+            missing_vars = ", ".join(missing)
+            raise RuntimeError(
+                "Partial distributed launcher environment detected. "
+                f"Missing: {missing_vars}."
+            )
+
+        runtime = DistributedRuntime(
+            rank=int(env_values["RANK"]),
+            world_size=int(env_values["WORLD_SIZE"]),
+            local_rank=int(env_values["LOCAL_RANK"]),
+        )
+        if runtime.world_size != args.tensor_parallel_size:
+            raise RuntimeError(
+                "This benchmark expects WORLD_SIZE to match "
+                f"--tensor-parallel-size. Got WORLD_SIZE={runtime.world_size} "
+                f"and --tensor-parallel-size={args.tensor_parallel_size}."
+            )
+        return runtime
+
+    if args.tensor_parallel_size > 1:
+        raise RuntimeError(
+            "Multi-GPU tensor parallel benchmarking must be launched with "
+            "torchrun. Example: "
+            "torchrun --nproc_per_node=2 "
+            "benchmarks/kernels/benchmark_kimi_k25_nvfp4_mla_attention.py "
+            "--tensor-parallel-size 2"
+        )
+
+    return DistributedRuntime(rank=0, world_size=1, local_rank=0)
+
+
+def _set_cuda_device(runtime: DistributedRuntime) -> torch.device:
+    if runtime.local_rank < 0:
+        raise RuntimeError(
+            f"LOCAL_RANK must be non-negative, got {runtime.local_rank}."
+        )
+
+    visible_device_count = torch.cuda.device_count()
+    if runtime.local_rank >= visible_device_count:
+        raise RuntimeError(
+            f"LOCAL_RANK={runtime.local_rank} is out of range for "
+            f"{visible_device_count} visible CUDA devices."
+        )
+
+    device = torch.device(f"cuda:{runtime.local_rank}")
+    torch.accelerator.set_device_index(device)
+    return device
+
+
 @contextmanager
-def _maybe_init_single_rank_distributed(vllm_config: VllmConfig) -> Iterator[None]:
+def _maybe_init_distributed(
+    vllm_config: VllmConfig,
+    runtime: DistributedRuntime,
+    tensor_parallel_size: int,
+) -> Iterator[None]:
     created_distributed_env = False
     temp_path: str | None = None
 
     try:
-        if not torch.distributed.is_initialized():
-            fd, temp_path = tempfile.mkstemp(prefix="vllm_kimi_bench_")
-            os.close(fd)
+        if dist.is_initialized():
+            if (
+                dist.get_world_size() != runtime.world_size
+                or dist.get_rank() != runtime.rank
+            ):
+                raise RuntimeError(
+                    "Existing distributed process group does not match the "
+                    "launcher environment for this benchmark."
+                )
+        if not dist.is_initialized():
+            distributed_init_method = "env://"
+            if runtime.world_size == 1:
+                fd, temp_path = tempfile.mkstemp(prefix="vllm_kimi_bench_")
+                os.close(fd)
+                distributed_init_method = f"file://{temp_path}"
             with set_current_vllm_config(vllm_config):
                 init_distributed_environment(
-                    world_size=1,
-                    rank=0,
-                    distributed_init_method=f"file://{temp_path}",
-                    local_rank=0,
+                    world_size=runtime.world_size,
+                    rank=runtime.rank,
+                    distributed_init_method=distributed_init_method,
+                    local_rank=runtime.local_rank,
                     backend="nccl",
                 )
                 initialize_model_parallel(
-                    tensor_model_parallel_size=1,
+                    tensor_model_parallel_size=tensor_parallel_size,
                     pipeline_model_parallel_size=1,
                 )
             created_distributed_env = True
         elif not model_parallel_is_initialized():
             with set_current_vllm_config(vllm_config):
                 initialize_model_parallel(
-                    tensor_model_parallel_size=1,
+                    tensor_model_parallel_size=tensor_parallel_size,
                     pipeline_model_parallel_size=1,
                 )
+        elif get_tensor_model_parallel_world_size() != tensor_parallel_size:
+            raise RuntimeError(
+                "Existing tensor parallel group does not match "
+                f"--tensor-parallel-size={tensor_parallel_size}."
+            )
 
         yield
     finally:
+        if dist.is_initialized() and runtime.world_size > 1:
+            dist.barrier()
         if created_distributed_env:
             cleanup_dist_env_and_memory()
         if temp_path is not None:
@@ -334,7 +444,9 @@ def _build_decode_batch(
         token_idx = seq_len - 1
         block_idx = token_idx // block_size
         offset_in_block = token_idx % block_size
-        slot_mapping[req_idx] = (current_block + block_idx) * block_size + offset_in_block
+        slot_mapping[req_idx] = (
+            (current_block + block_idx) * block_size + offset_in_block
+        )
         current_block += num_blocks
 
     common_attn_metadata = CommonAttentionMetadata(
@@ -383,6 +495,20 @@ class TensorFiniteSummary:
     min_finite: float | None
     mean_finite: float | None
     max_finite: float | None
+
+
+def _barrier_if_distributed() -> None:
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.barrier()
+
+
+def _reduce_max_time_ms(value_ms: float, *, device: torch.device) -> float:
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return value_ms
+
+    reduced = torch.tensor(value_ms, device=device)
+    dist.all_reduce(reduced, op=dist.ReduceOp.MAX)
+    return float(reduced.item())
 
 
 def _tensor_preview(
@@ -793,7 +919,9 @@ def _benchmark_attention_variant(
             batch_descriptor if summary_cg_mode == CUDAGraphMode.FULL else None
         ),
     ):
-        mla_forward_context_lines = _summarize_mla_forward_context(layer.mla_attn.layer_name)
+        mla_forward_context_lines = _summarize_mla_forward_context(
+            layer.mla_attn.layer_name
+        )
 
     def run_forward(cg_mode: CUDAGraphMode) -> torch.Tensor:
         with set_forward_context(
@@ -812,9 +940,11 @@ def _benchmark_attention_variant(
         last_output = run_forward(CUDAGraphMode.NONE)
 
     torch.cuda.synchronize()
+    _barrier_if_distributed()
 
     if args.cudagraph:
         graph = torch.cuda.CUDAGraph()
+        _barrier_if_distributed()
         with graph_capture(device=positions.device) as graph_capture_context:
             with torch.cuda.graph(graph, stream=graph_capture_context.stream):
                 last_output = run_forward(CUDAGraphMode.FULL)
@@ -823,6 +953,7 @@ def _benchmark_attention_variant(
         for _ in range(max(1, warmup_iters)):
             graph.replay()
         torch.cuda.synchronize()
+        _barrier_if_distributed()
 
         def benchmark_fn() -> None:
             graph.replay()
@@ -833,14 +964,21 @@ def _benchmark_attention_variant(
             nonlocal last_output
             last_output = run_forward(CUDAGraphMode.NONE)
 
+    _barrier_if_distributed()
     for _ in range(args.trials):
         start_event.record()
         benchmark_fn()
         end_event.record()
         torch.cuda.synchronize()
-        times_ms.append(start_event.elapsed_time(end_event))
+        times_ms.append(
+            _reduce_max_time_ms(
+                start_event.elapsed_time(end_event),
+                device=positions.device,
+            )
+        )
 
     assert last_output is not None
+    _barrier_if_distributed()
     return BenchmarkVariantResult(
         spec=spec,
         layer=layer,
@@ -862,6 +1000,7 @@ def _compare_variant_outputs(
     per_layer_slot_mapping: dict[str, torch.Tensor],
     num_tokens: int,
 ) -> dict[str, object]:
+    _barrier_if_distributed()
     original_layer.mla_attn.kv_cache = kv_cache_template.clone()
     forked_layer.mla_attn.kv_cache = kv_cache_template.clone()
 
@@ -873,8 +1012,15 @@ def _compare_variant_outputs(
         cudagraph_runtime_mode=CUDAGraphMode.NONE,
         batch_descriptor=None,
     ):
-        original_output = original_layer(positions=positions, hidden_states=hidden_states)
-        forked_output = forked_layer(positions=positions, hidden_states=hidden_states)
+        original_output = original_layer(
+            positions=positions,
+            hidden_states=hidden_states,
+        )
+        forked_output = forked_layer(
+            positions=positions,
+            hidden_states=hidden_states,
+        )
+    _barrier_if_distributed()
 
     original_output_summary = _summarize_tensor_finiteness(original_output)
     forked_output_summary = _summarize_tensor_finiteness(forked_output)
@@ -893,7 +1039,9 @@ def _compare_variant_outputs(
 
     finite_positions = int(finite_mask.sum().item())
     if finite_positions > 0:
-        diff = (original_output_float[finite_mask] - forked_output_float[finite_mask]).abs()
+        diff = (
+            original_output_float[finite_mask] - forked_output_float[finite_mask]
+        ).abs()
         total_abs_diff = diff.sum().item()
         mean_abs_diff = diff.mean().item()
         max_abs_diff = diff.max().item()
@@ -949,6 +1097,8 @@ def _print_variant_result(
     print(
         "hidden_size: "
         f"{result.layer.hidden_size}, num_heads: {result.layer.num_heads}, "
+        f"num_local_heads: {result.layer.num_local_heads}, "
+        f"tensor_parallel_size: {args.tensor_parallel_size}, "
         f"q_lora_rank: {result.layer.q_lora_rank}, "
         f"kv_lora_rank: {result.layer.kv_lora_rank}"
     )
@@ -962,7 +1112,9 @@ def _print_variant_result(
     )
     print(
         "kv cache: "
-        f"dtype={args.kv_cache_dtype}, shape={tuple(result.layer.mla_attn.kv_cache.shape)}, "
+        "dtype="
+        f"{args.kv_cache_dtype}, "
+        f"shape={tuple(result.layer.mla_attn.kv_cache.shape)}, "
         f"size_mib={kv_cache_mebibytes:.1f}"
     )
     for line in result.mla_forward_context_lines:
@@ -977,6 +1129,8 @@ def _print_variant_result(
             _summarize_tensor_finiteness(result.output),
         )
     )
+    if args.tensor_parallel_size > 1:
+        print("timing_aggregation: max_across_tensor_parallel_ranks")
     print(
         "timing_ms: "
         f"mean={mean_ms:.3f}, std={stdev_ms:.3f}, "
@@ -989,16 +1143,21 @@ def _print_variant_result(
 def main() -> None:
     args = _parse_args()
     _validate_args(args)
+    runtime = _get_distributed_runtime(args)
+    device = _set_cuda_device(runtime)
     set_random_seed(args.seed)
 
-    device = torch.device("cuda")
     vllm_config = _build_vllm_config(args)
     model_dtype = vllm_config.model_config.dtype
     hf_config = vllm_config.model_config.hf_config
     variant_specs = _get_kernel_variant_specs(args.kernel_mode)
     input_tensor_sanity_lines: list[str] = []
 
-    with _maybe_init_single_rank_distributed(vllm_config):
+    with _maybe_init_distributed(
+        vllm_config,
+        runtime,
+        args.tensor_parallel_size,
+    ):
         if not is_workspace_manager_initialized():
             init_workspace_manager(device)
 
@@ -1078,7 +1237,8 @@ def main() -> None:
                 layer_name: attn_metadata for layer_name in layer_names
             }
             per_layer_slot_mapping = {
-                layer_name: common_attn_metadata.slot_mapping for layer_name in layer_names
+                layer_name: common_attn_metadata.slot_mapping
+                for layer_name in layer_names
             }
 
             results: list[BenchmarkVariantResult] = []
@@ -1112,9 +1272,17 @@ def main() -> None:
                     num_tokens=args.batch_size,
                 )
 
+    if not runtime.is_primary:
+        return
+
     seq_lens_cpu = common_attn_metadata._seq_lens_cpu
     print(f"model: {args.model}")
     print(f"kernel_mode: {args.kernel_mode}")
+    print(
+        "distributed: "
+        f"tensor_parallel_size={args.tensor_parallel_size}, "
+        f"world_size={runtime.world_size}"
+    )
     for line in input_tensor_sanity_lines:
         print(line)
     print()
@@ -1155,7 +1323,10 @@ def main() -> None:
             f"+inf={comparison['matching_posinf_positions']}, "
             f"-inf={comparison['matching_neginf_positions']}"
         )
-        print("  diff_stats_note: computed only on positions where both outputs are finite")
+        print(
+            "  diff_stats_note: computed only on positions where both outputs "
+            "are finite"
+        )
         print(f"  total_abs_diff: {comparison['total_abs_diff']:.6f}")
         print(f"  mean_abs_diff: {comparison['mean_abs_diff']:.6f}")
         print(f"  max_abs_diff: {comparison['max_abs_diff']:.6f}")

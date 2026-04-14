@@ -231,7 +231,7 @@ def _forked_kimi_mla_attn(
     output: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    """Forked full MLA attention block for benchmark experimentation."""
+    """Forked MLA attention block through W_UV for benchmarking."""
     layer = get_forward_context().no_compile_layers[layer_name]
     mla = layer.mla_attn
 
@@ -314,12 +314,7 @@ def _forked_kimi_mla_attn(
 
         mla.impl.dcp_world_size = get_dcp_group().world_size
 
-    attn_out_padded = torch.empty(
-        (hidden_states.shape[0], layer.num_local_heads * layer.v_head_dim),
-        dtype=q.dtype,
-        device=q.device,
-    )
-    attn_output = attn_out_padded[:num_actual_toks]
+    attn_output = output[:num_actual_toks]
     q = q[:num_actual_toks]
     kv_c = kv_c[:num_actual_toks]
     k_pe = k_pe[:num_actual_toks]
@@ -390,7 +385,6 @@ def _forked_kimi_mla_attn(
         out = out.transpose(0, 1)
         torch.bmm(x, mla.W_UV, out=out)
 
-    output.copy_(layer.o_proj(attn_out_padded)[0])
     return output
 
 
@@ -814,18 +808,18 @@ class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        output = torch.empty(
-            hidden_states.shape,
+        attn_output = torch.empty(
+            (hidden_states.shape[0], self.num_local_heads * self.v_head_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
         attn_out = torch.ops.vllm.forked_monolithic_attn(
             positions,
             hidden_states,
-            output,
+            attn_output,
             self.layer_name,
         )
-        return attn_out
+        return self.o_proj(attn_out)[0]
 
 
 class KimiK25Nvfp4DecoderLayer(nn.Module):
@@ -848,7 +842,7 @@ class KimiK25Nvfp4DecoderLayer(nn.Module):
         parallel_config = vllm_config.parallel_config
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = KimiK25Nvfp4MLAAttention(
+        self.self_attn = ForkedKimiK25Nvfp4MLAAttention(
             vllm_config=vllm_config,
             config=config,
             cache_config=cache_config,

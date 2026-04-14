@@ -788,9 +788,6 @@ def _build_cutedsl_version() -> KernelVersion:
             scratch[1] = a * sin + b * cos
             cute.autovec_copy(scratch[None, 0], key[bidx, 0, (None, tidx)])
 
-        if bidy > 0:
-            cute.arch.sync_threads()
-
     @cute.jit
     def kimik25_rope(
         positions: cute.Tensor,  # (Sp,)

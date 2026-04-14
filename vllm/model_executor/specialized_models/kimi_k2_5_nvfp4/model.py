@@ -584,43 +584,51 @@ def kimik25_rmsnorm_special_qkv_fused_kernel(
     nwarps = total_lora_dim // 128
     allocator = cutlass.utils.SmemAllocator()
     sdata = allocator.allocate_tensor(cutlass.Float32,
-                                     layout=cute.make_layout((nwarps, 2), stride=(1, nwarps)),
+                                     layout=cute.make_layout(nwarps),
                                      byte_alignment=16,
                                      swizzle=None)
-    invnorms = allocator.allocate_tensor(cutlass.Float32, layout=cute.make_layout(2), byte_alignment=16, swizzle=None)
 
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
 
-    x0 = data[bid, (tid, 0)].to(cutlass.Float32)
-    x1 = data[bid, (tid, 1)].to(cutlass.Float32)
-    x2 = data[bid, (tid, 2)].to(cutlass.Float32)
-    x3 = data[bid, (tid, 3)].to(cutlass.Float32)
-    a_sum = x0 * x0 + x1 * x1 + x2 * x2
-    b_sum = x3 * x3
+    x0: cutlass.Float32 = 0.0
+    x1: cutlass.Float32 = 0.0
+    x2: cutlass.Float32 = 0.0
+    x3: cutlass.Float32 = 0.0
+    is_q = bid < data.shape[0]
+    sum: cutlass.Float32 = 0.0
+    if is_q:
+        x0 = data[bid, (tid, 0)].to(cutlass.Float32)
+        x1 = data[bid, (tid, 1)].to(cutlass.Float32)
+        x2 = data[bid, (tid, 2)].to(cutlass.Float32)
+        sum = x0 * x0 + x1 * x1 + x2 * x2
+    else:
+        x3 = data[bid, (tid, 3)].to(cutlass.Float32)
+        sum = x3 * x3
     
-    a_sum = cute.arch.warp_reduction_sum(a_sum, threads_in_group=32)
-    b_sum = cute.arch.warp_reduction_sum(b_sum, threads_in_group=32)
+    sum = cute.arch.warp_reduction_sum(sum, threads_in_group=32)
     if tid % 32 == 0:
-        sdata[tid // 32, 0] = a_sum
-        sdata[tid // 32, 1] = b_sum
+        sdata[tid // 32] = sum
 
     cute.arch.sync_threads()
     if tid < 32:
-        sum = sdata[tid]  # intended flat index
-        sum = cute.arch.warp_reduction_sum(sum, threads_in_group=nwarps)
-        if tid % nwarps == 0:
-            i = tid // nwarps
-            lora_dim = lora_dim_kv if i == 1 else lora_dim_q
-            eps = eps_kv if i == 1 else eps_q
-            invnorms[i] = cute.math.rsqrt(sum / lora_dim + eps)
+        ssum: cutlass.Float32 = 0.0
+        if tid < nwarps:
+            ssum = sdata[tid]
+
+        ssum = cute.arch.warp_reduction_sum(ssum, threads_in_group=nwarps)
+        lora_dim = lora_dim_q if is_q else lora_dim_kv
+        eps = eps_q if is_q else eps_kv
+        sdata[0] = cute.math.rsqrt(ssum / lora_dim + eps)
 
     cute.arch.sync_threads()
-    invnorm_q, invnorm_kv = invnorms[0], invnorms[1]
-    data[bid, (tid, 0)] = (x0 * invnorm_q).to(cutlass.BFloat16) * weights_q[tid]
-    data[bid, (tid, 1)] = (x1 * invnorm_q).to(cutlass.BFloat16) * weights_q[tid + lora_dim_kv]
-    data[bid, (tid, 2)] = (x2 * invnorm_q).to(cutlass.BFloat16) * weights_q[tid + lora_dim_kv * 2]
-    data[bid, (tid, 3)] = (x3 * invnorm_kv).to(cutlass.BFloat16) * weights_kv[tid]
+    invnorm = sdata[0]
+    if is_q:
+        data[bid, (tid, 0)] = (x0 * invnorm).to(cutlass.BFloat16) * weights_q[tid]
+        data[bid, (tid, 1)] = (x1 * invnorm).to(cutlass.BFloat16) * weights_q[tid + lora_dim_kv]
+        data[bid, (tid, 2)] = (x2 * invnorm).to(cutlass.BFloat16) * weights_q[tid + lora_dim_kv * 2]
+    else:
+        data[bid, (tid, 3)] = (x3 * invnorm).to(cutlass.BFloat16) * weights_kv[tid]
 
 @cute.jit
 def kimik25_rmsnorm_special_qkv_fused(
@@ -640,7 +648,7 @@ def kimik25_rmsnorm_special_qkv_fused(
         data.iterator,
         cute.make_layout((data.shape[0], (lora_dim_kv, 4)), stride=(data.stride[0], (1, lora_dim_kv)))
     )
-    grid = (data.shape[0], 1, 1)
+    grid = (data.shape[0] * 2, 1, 1)
     block = (lora_dim_kv, 1, 1)
     kimik25_rmsnorm_special_qkv_fused_kernel(data, weights_q, weights_kv, lora_dim_q, lora_dim_kv, eps_q, eps_kv).launch(grid=grid, block=block, stream=stream)
 

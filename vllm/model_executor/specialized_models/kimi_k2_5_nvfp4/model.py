@@ -726,53 +726,63 @@ def kimik25_rmsnorm_special_qkv_fused(
     ).launch(grid=grid, block=block, stream=stream)
 
 
-
 @cute.kernel
 def kimik25_rope_kernel(
-    positions: cute.Tensor, # (Sp,)
-    query: cute.Tensor, # (Sp, N_local, (2, R // 2))
-    key: cute.Tensor, # (Sp, 1, (2, R // 2))
-    cos_sin_cache: cute.Tensor, # (max_position_embeddings, (R // 2, 2))
+    positions: cute.Tensor,  # (Sp,)
+    query: cute.Tensor,  # (Sp, (K, N_local // K), (2, R // 2))
+    key: cute.Tensor,  # (Sp, 1, (2, R // 2))
+    cos_sin_cache: cute.Tensor,  # (max_position_embeddings, R)
+    K: cutlass.Constexpr,
 ):
-    tid, _, _ = cute.arch.thread_idx()
+    scratch = cute.make_rmem_tensor((2, K), dtype=cutlass.BFloat16)
+
+    tidx, _, _ = cute.arch.thread_idx()
     bidx, bidy, _ = cute.arch.block_idx()
-    result = cute.make_rmem_tensor_like(query[0, 0, (None, 0)])
 
-    cache_row = cos_sin_cache[positions[bidx], (tid, None)]
-    cos, sin = cache_row[0], cache_row[1]
-
-    if bidy < query.shape[1]:
-        query_slice = query[bidx, bidy, (None, tid)].load()
-        a, b = query_slice[0], query_slice[1]
-        result[0] = a * cos - b * sin
-        result[1] = a * sin + b * cos
-        query[bidx, bidy, (None, tid)].store(result.load())
+    pos = positions[bidx]
+    cos, sin = cos_sin_cache[pos, tidx], cos_sin_cache[pos, tidx + 32]
+    if bidy > 0:
+        for i in cutlass.range_constexpr(K):
+            cute.autovec_copy(query[bidx, (i, bidy - 1), (None, tidx)], scratch[None, i])
+        
+        for i in cutlass.range_constexpr(K):
+            a, b = scratch[0, i], scratch[1, i]
+            scratch[0, i] = a * cos - b * sin
+            scratch[1, i] = a * sin + b * cos
+            cute.autovec_copy(scratch[None, i], query[bidx, (i, bidy - 1), (None, tidx)])
     else:
-        key_slice = key[bidx, 0, (None, tid)].load()
-        a, b = key_slice[0], key_slice[1]
-        result[0] = a * cos - b * sin
-        result[1] = a * sin + b * cos
-        key[bidx, 0, (None, tid)].store(result.load())
+        cute.autovec_copy(key[bidx, 0, (None, tidx)], scratch[None, 0])
+        a, b = scratch[0], scratch[1]
+        scratch[0] = a * cos - b * sin
+        scratch[1] = a * sin + b * cos
+        cute.autovec_copy(scratch[None, 0], key[bidx, 0, (None, tidx)])
 
 @cute.jit
 def kimik25_rope(
-    positions: cute.Tensor, # (Sp,)
-    query: cute.Tensor, # (Sp, N_local, R):(?, ?, 1)
-    key: cute.Tensor, # (Sp, 1, R)
-    cos_sin_cache: cute.Tensor, # (max_position_embeddings, R)
+    positions: cute.Tensor,  # (Sp,)
+    query: cute.Tensor,  # (Sp, N_local, R):(?, ?, 1)
+    key: cute.Tensor,  # (Sp, 1, R)
+    cos_sin_cache: cute.Tensor,  # (max_position_embeddings, R)
     N_local: cutlass.Constexpr,
     half_rope_dim: cutlass.Constexpr,
-    stream: CUstream
+    stream: CUstream,
 ):
+    K: cutlass.Constexpr = 8
+    assert N_local % K == 0
     sp = positions.shape[0]
     query = cute.make_tensor(
         query.iterator,
-        cute.make_layout((sp, N_local, (2, half_rope_dim)),
-                         stride=((cute.assume(query.stride[0], divby=2), cute.assume(query.stride[1], divby=2), (1, 2))))
+        cute.make_layout(
+            (sp, (K, N_local // K), (2, half_rope_dim)),
+            stride=(cute.assume(query.stride[0], divby=2), (cute.assume(query.stride[1], divby=2), query.stride[1] * K), (1, 2)),
+        ),
     )
     key = cute.logical_divide(key, (1, 1, 2))[(0, None), (0, None), None]
-    cos_sin_cache = cute.logical_divide(cos_sin_cache, (1, half_rope_dim))[(0, None), None]
-    kimik25_rope_kernel(positions, query, key, cos_sin_cache).launch(grid=(sp, N_local + 1, 1), block=(half_rope_dim, 1, 1), stream=stream)
+    kimik25_rope_kernel(positions, query, key, cos_sin_cache, K).launch(
+        grid=(sp, N_local // K + 1, 1),
+        block=(half_rope_dim, 1, 1),
+        stream=stream,
+    )
 
 class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
     """Forked MLA path for kernel benchmarking experiments."""

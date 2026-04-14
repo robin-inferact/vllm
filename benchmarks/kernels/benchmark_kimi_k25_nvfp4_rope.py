@@ -766,24 +766,23 @@ def _build_cutedsl_version() -> KernelVersion:
     ):
         tid, _, _ = cute.arch.thread_idx()
         bidx, bidy, _ = cute.arch.block_idx()
+        result = cute.make_rmem_tensor_like(query[0, 0, (None, 0)])
 
         cache_row = cos_sin_cache[positions[bidx], (tid, None)]
         cos, sin = cache_row[0], cache_row[1]
 
         if bidy < query.shape[1]:
-            query_slice = query[bidx, bidy, (None, tid)]
+            query_slice = query[bidx, bidy, (None, tid)].load()
             a, b = query_slice[0], query_slice[1]
-            a_new = a * cos - b * sin
-            b_new = a * sin + b * cos
-            query_slice[0] = a_new
-            query_slice[1] = b_new
+            result[0] = a * cos - b * sin
+            result[1] = a * sin + b * cos
+            query[bidx, bidy, (None, tid)].store(result.load())
         else:
-            key_slice = key[bidx, 0, (None, tid)]
+            key_slice = key[bidx, 0, (None, tid)].load()
             a, b = key_slice[0], key_slice[1]
-            a_new = a * cos - b * sin
-            b_new = a * sin + b * cos
-            key_slice[0] = a_new
-            key_slice[1] = b_new
+            result[0] = a * cos - b * sin
+            result[1] = a * sin + b * cos
+            key[bidx, 0, (None, tid)].store(result.load())
 
     @cute.jit
     def kimik25_rope(
@@ -800,7 +799,7 @@ def _build_cutedsl_version() -> KernelVersion:
             query.iterator,
             cute.make_layout(
                 (sp, N_local, (2, half_rope_dim)),
-                stride=(query.stride[0], query.stride[1], (1, 2)),
+                stride=(cute.assume(query.stride[0], divby=2), cute.assume(query.stride[1], divby=2), (1, 2)),
             ),
         )
         key = cute.logical_divide(key, (1, 1, 2))[(0, None), (0, None), None]

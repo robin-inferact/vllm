@@ -226,19 +226,61 @@ def _kimi_mla_attn_fake(
 
 
 def _forked_kimi_mla_attn(
-    q: torch.Tensor,
-    kv_c_normed: torch.Tensor,
-    k_pe: torch.Tensor,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    """Forked monolithic MLA attention for benchmark experimentation."""
-    mla: MLAAttention = get_forward_context().no_compile_layers[layer_name]
+    """Forked full MLA attention block for benchmark experimentation."""
+    layer = get_forward_context().no_compile_layers[layer_name]
+    mla = layer.mla_attn
+
+    qkv_a, _ = layer.fused_qkv_a_proj(hidden_states)
+    qkv_c, k_pe = qkv_a.split(
+        [layer.q_lora_rank + layer.kv_lora_rank, layer.qk_rope_head_dim],
+        dim=-1,
+    )
+
+    qkv_c_cute = from_dlpack(qkv_c, assumed_align=16).mark_layout_dynamic()
+    q_c_layernorm_weights_cute = from_dlpack(layer.q_a_layernorm.weight.detach(), assumed_align=16)
+    kv_c_layernorm_weights_cute = from_dlpack(layer.kv_a_layernorm.weight.detach(), assumed_align=16)
+    kimik25_rmsnorm_special_qkv_fused(
+        data=qkv_c_cute,
+        weights_q=q_c_layernorm_weights_cute,
+        weights_kv=kv_c_layernorm_weights_cute,
+        lora_dim_q=layer.q_a_layernorm.hidden_size,
+        lora_dim_kv=layer.kv_a_layernorm.hidden_size,
+        eps_q=layer.q_a_layernorm.variance_epsilon,
+        eps_kv=layer.kv_a_layernorm.variance_epsilon,
+        stream=cutlass.torch.current_stream(),
+    )
+
+    q_c, kv_c = qkv_c.split([layer.q_lora_rank, layer.kv_lora_rank], dim=-1)
+    q, _ = layer.q_b_proj(q_c)
+
+    q = q.view(-1, layer.num_local_heads, layer.qk_head_dim)
+    q_pe = q[..., layer.qk_nope_head_dim:]
+    k_pe = k_pe.unsqueeze(1)
+
+    assert q_pe.dtype == layer.rotary_emb.cos_sin_cache.dtype
+    positions_cute = from_dlpack(positions)
+    q_pe_cute = from_dlpack(q_pe, assumed_align=16).mark_layout_dynamic()
+    k_pe_cute = from_dlpack(k_pe, assumed_align=16)
+    cos_sin_cache_cute = from_dlpack(layer.rotary_emb.cos_sin_cache)
+    kimik25_rope(
+        positions_cute,
+        q_pe_cute,
+        k_pe_cute,
+        cos_sin_cache_cute,
+        layer.num_local_heads,
+        layer.qk_rope_head_dim // 2,
+        cutlass.torch.current_stream(),
+    )
 
     fwd_ctx = get_forward_context()
     attn_metadata = fwd_ctx.attn_metadata
     if isinstance(attn_metadata, dict):
-        attn_metadata = attn_metadata.get(layer_name)
+        attn_metadata = attn_metadata.get(mla.layer_name)
 
     if attn_metadata is None:
         output.zero_()
@@ -250,16 +292,16 @@ def _forked_kimi_mla_attn(
         return output
 
     if mla.calculate_kv_scales:
-        mla.calc_kv_scales(q, kv_c_normed, k_pe)
+        mla.calc_kv_scales(q, kv_c, k_pe)
 
     kv_cache = mla.kv_cache
     if kv_cache.numel() > 0:
         slot_mapping = fwd_ctx.slot_mapping
         if isinstance(slot_mapping, dict):
-            slot_mapping = slot_mapping.get(layer_name)
+            slot_mapping = slot_mapping.get(mla.layer_name)
         if slot_mapping is not None:
             ops.concat_and_cache_mla(
-                kv_c_normed,
+                kv_c,
                 k_pe.squeeze(1),
                 kv_cache,
                 slot_mapping.flatten(),
@@ -272,10 +314,14 @@ def _forked_kimi_mla_attn(
 
         mla.impl.dcp_world_size = get_dcp_group().world_size
 
-    output_padded = output
-    output = output[:num_actual_toks]
+    attn_out_padded = torch.empty(
+        (hidden_states.shape[0], layer.num_local_heads * layer.v_head_dim),
+        dtype=q.dtype,
+        device=q.device,
+    )
+    attn_output = attn_out_padded[:num_actual_toks]
     q = q[:num_actual_toks]
-    kv_c_normed = kv_c_normed[:num_actual_toks]
+    kv_c = kv_c[:num_actual_toks]
     k_pe = k_pe[:num_actual_toks]
 
     fp8_attn = is_quantized_kv_cache(mla.kv_cache_dtype)
@@ -293,12 +339,12 @@ def _forked_kimi_mla_attn(
     if num_mha_tokens > 0:
         mla.impl.forward_mha(
             q[num_mqa_tokens:],
-            kv_c_normed[num_mqa_tokens:],
+            kv_c[num_mqa_tokens:],
             k_pe[num_mqa_tokens:],
             kv_cache,
             attn_metadata,
             mla._k_scale,
-            output=output[num_mqa_tokens:],
+            output=attn_output[num_mqa_tokens:],
         )
 
     if num_mqa_tokens > 0:
@@ -335,24 +381,26 @@ def _forked_kimi_mla_attn(
         else:
             mqa_q_final = (mqa_ql_nope, mqa_q_pe)
 
-        attn_out, _ = mla.impl.forward_mqa(mqa_q_final, kv_cache, attn_metadata, mla)
+        decode_attn_out, _ = mla.impl.forward_mqa(
+            mqa_q_final, kv_cache, attn_metadata, mla
+        )
 
-        x = attn_out.view(-1, mla.num_heads, mla.kv_lora_rank).transpose(0, 1)
-        out = output[:num_mqa_tokens].view(-1, mla.num_heads, mla.v_head_dim)
+        x = decode_attn_out.view(-1, mla.num_heads, mla.kv_lora_rank).transpose(0, 1)
+        out = attn_output[:num_mqa_tokens].view(-1, mla.num_heads, mla.v_head_dim)
         out = out.transpose(0, 1)
         torch.bmm(x, mla.W_UV, out=out)
 
-    return output_padded
+    output.copy_(layer.o_proj(attn_out_padded)[0])
+    return output
 
 
 def _forked_kimi_mla_attn_fake(
-    q: torch.Tensor,
-    kv_c_normed: torch.Tensor,
-    k_pe: torch.Tensor,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    del q, kv_c_normed, k_pe, layer_name
+    del positions, hidden_states, layer_name
     return output
 
 
@@ -688,24 +736,23 @@ def kimik25_rope_kernel(
 ):
     tid, _, _ = cute.arch.thread_idx()
     bidx, bidy, _ = cute.arch.block_idx()
+    result = cute.make_rmem_tensor_like(query[0, 0, (None, 0)])
 
     cache_row = cos_sin_cache[positions[bidx], (tid, None)]
     cos, sin = cache_row[0], cache_row[1]
-    
+
     if bidy < query.shape[1]:
-        query_slice = query[bidx, bidy, (None, tid)]
+        query_slice = query[bidx, bidy, (None, tid)].load()
         a, b = query_slice[0], query_slice[1]
-        a_new = a * cos - b * sin
-        b_new = a * sin + b * cos
-        query_slice[0] = a_new
-        query_slice[1] = b_new
+        result[0] = a * cos - b * sin
+        result[1] = a * sin + b * cos
+        query[bidx, bidy, (None, tid)].store(result.load())
     else:
-        key_slice = key[bidx, 0, (None, tid)]
+        key_slice = key[bidx, 0, (None, tid)].load()
         a, b = key_slice[0], key_slice[1]
-        a_new = a * cos - b * sin
-        b_new = a * sin + b * cos
-        key_slice[0] = a_new
-        key_slice[1] = b_new
+        result[0] = a * cos - b * sin
+        result[1] = a * sin + b * cos
+        key[bidx, 0, (None, tid)].store(result.load())
 
 @cute.jit
 def kimik25_rope(
@@ -720,7 +767,8 @@ def kimik25_rope(
     sp = positions.shape[0]
     query = cute.make_tensor(
         query.iterator,
-        cute.make_layout((sp, N_local, (2, half_rope_dim)), stride=((query.stride[0], query.stride[1], (1, 2))))
+        cute.make_layout((sp, N_local, (2, half_rope_dim)),
+                         stride=((cute.assume(query.stride[0], divby=2), cute.assume(query.stride[1], divby=2), (1, 2))))
     )
     key = cute.logical_divide(key, (1, 1, 2))[(0, None), (0, None), None]
     cos_sin_cache = cute.logical_divide(cos_sin_cache, (1, half_rope_dim))[(0, None), None]
@@ -729,60 +777,45 @@ def kimik25_rope(
 class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
     """Forked MLA path for kernel benchmarking experiments."""
 
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        config,
+        cache_config,
+        quant_config,
+        prefix: str,
+    ) -> None:
+        super().__init__(
+            vllm_config=vllm_config,
+            config=config,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+        compilation_config = vllm_config.compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+        self.layer_name = prefix
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv_a, _ = self.fused_qkv_a_proj(hidden_states)
-        qkv_c, k_pe = qkv_a.split(
-            [self.q_lora_rank + self.kv_lora_rank, self.qk_rope_head_dim],
-            dim=-1,
-        )
-
-        qkv_c_cute = from_dlpack(qkv_c).mark_layout_dynamic()
-        q_c_layernorm_weights_cute = from_dlpack(self.q_a_layernorm.weight.detach())
-        kv_c_layernorm_weights_cute = from_dlpack(self.kv_a_layernorm.weight.detach())
-        kimik25_rmsnorm_special_qkv_fused(
-            data=qkv_c_cute,
-            weights_q=q_c_layernorm_weights_cute,
-            weights_kv=kv_c_layernorm_weights_cute,
-            lora_dim_q=self.q_a_layernorm.hidden_size,
-            lora_dim_kv=self.kv_a_layernorm.hidden_size,
-            eps_q=self.q_a_layernorm.variance_epsilon,
-            eps_kv=self.kv_a_layernorm.variance_epsilon,
-            stream=cutlass.torch.current_stream())
-
-        q_c, kv_c = qkv_c.split([self.q_lora_rank, self.kv_lora_rank], dim=-1)
-        q, _ = self.q_b_proj(q_c)
-
-        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
-        q_pe = q[..., self.qk_nope_head_dim :]
-        k_pe = k_pe.unsqueeze(1)
-        # q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-
-        assert(q_pe.dtype == self.rotary_emb.cos_sin_cache.dtype)
-        positions_cute = from_dlpack(positions)
-        q_pe_cute = from_dlpack(q_pe).mark_layout_dynamic()
-        k_pe_cute = from_dlpack(k_pe)
-        cos_sin_cache_cute = from_dlpack(self.rotary_emb.cos_sin_cache)
-        kimik25_rope(positions_cute, q_pe_cute, k_pe_cute, cos_sin_cache_cute, self.num_local_heads, self.qk_rope_head_dim // 2, cutlass.torch.current_stream())
-
-        mla = self.mla_attn
         output = torch.empty(
-            (hidden_states.shape[0], self.num_local_heads * self.v_head_dim),
-            dtype=q.dtype,
-            device=q.device,
+            hidden_states.shape,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
         )
         attn_out = torch.ops.vllm.forked_monolithic_attn(
-            q,
-            kv_c,
-            k_pe,
+            positions,
+            hidden_states,
             output,
-            mla.layer_name,
+            self.layer_name,
         )
-        return self.o_proj(attn_out)[0]
+        return attn_out
 
 
 class KimiK25Nvfp4DecoderLayer(nn.Module):

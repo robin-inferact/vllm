@@ -790,6 +790,7 @@ class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
         quant_config,
         prefix: str,
     ) -> None:
+        print("Initializing ForkedKimiK25Nvfp4MLAAttention")
         super().__init__(
             vllm_config=vllm_config,
             config=config,

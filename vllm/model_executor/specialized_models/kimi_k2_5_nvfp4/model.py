@@ -10,7 +10,9 @@ import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 import torch
 from cuda.bindings.driver import CUstream
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cutlass_dsl import T, dsl_user_op
 from torch import nn
 
 from vllm import _custom_ops as ops
@@ -18,6 +20,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -49,11 +52,13 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
     is_quantized_kv_cache,
 )
+from vllm.v1.attention.selector import get_attn_backend
 
 _TARGET_MODEL_NAMES = {"nvidia/Kimi-K2.5-NVFP4"}
+logger = init_logger(__name__)
 
 
-def _is_target_kimi_nvfp4(vllm_config: VllmConfig) -> bool:
+def _is_kimi_nvfp4_checkpoint(vllm_config: VllmConfig) -> bool:
     model_name = vllm_config.model_config.model
     if model_name in _TARGET_MODEL_NAMES:
         return True
@@ -74,6 +79,69 @@ def _is_target_kimi_nvfp4(vllm_config: VllmConfig) -> bool:
         getattr(text_config, "model_type", None) == "deepseek_v3"
         and getattr(quantization_config, "get", lambda *_: None)("quant_algo")
         == "NVFP4"
+    )
+
+
+def _get_kimi_nvfp4_specialization_rejection_reason(
+    vllm_config: VllmConfig,
+) -> str | None:
+    if not _is_kimi_nvfp4_checkpoint(vllm_config):
+        return "the checkpoint is not nvidia/Kimi-K2.5-NVFP4"
+
+    cache_config = vllm_config.cache_config
+    kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
+    if not kv_cache_dtype.startswith("fp8"):
+        return (
+            "the specialized Kimi-K2.5 path requires an FP8 KV cache, "
+            f"but got {kv_cache_dtype!r}"
+        )
+
+    config = vllm_config.model_config.hf_config
+    text_config = getattr(config, "text_config", config)
+    num_local_heads = (
+        text_config.num_attention_heads // get_tensor_model_parallel_world_size()
+    )
+    try:
+        attn_backend = get_attn_backend(
+            head_size=text_config.kv_lora_rank + text_config.qk_rope_head_dim,
+            dtype=torch.get_default_dtype(),
+            kv_cache_dtype=kv_cache_dtype,
+            use_mla=True,
+            use_sparse=False,
+            num_heads=num_local_heads,
+        )
+    except Exception as exc:
+        return f"no compatible non-sparse MLA backend was selected: {exc}"
+
+    attn_backend_name = attn_backend.get_name()
+    if attn_backend_name == "TRITON_MLA":
+        return "TRITON_MLA does not support quantized query input for FP8 MLA"
+    if attn_backend_name == "CUTLASS_MLA":
+        return "CUTLASS_MLA requires q_pad_num_heads=128"
+
+    return None
+
+
+def _is_target_kimi_nvfp4(vllm_config: VllmConfig) -> bool:
+    return _get_kimi_nvfp4_specialization_rejection_reason(vllm_config) is None
+
+
+def _fallback_to_generic_kimi_k25(
+    vllm_config: VllmConfig,
+    prefix: str,
+    reason: str,
+) -> nn.Module:
+    from vllm.model_executor.models.kimi_k25 import (
+        KimiK25ForConditionalGeneration as GenericKimiK25ForConditionalGeneration,
+    )
+
+    logger.info_once(
+        "Falling back to the generic Kimi-K2.5 implementation because %s.",
+        reason,
+    )
+    return GenericKimiK25ForConditionalGeneration(
+        vllm_config=vllm_config,
+        prefix=prefix,
     )
 
 
@@ -287,11 +355,11 @@ def _forked_kimi_mla_attn(
     if kv_cache.numel() > 0:
         slot_mapping = fwd_ctx.slot_mapping.get(mla.layer_name)
         if slot_mapping is not None:
-            ops.concat_and_cache_mla(
-                kv_c,
-                k_pe.squeeze(1),
-                kv_cache,
-                slot_mapping.flatten(),
+            _run_kimik25_concat_and_cache_mla(
+                kv_c=kv_c,
+                k_pe=k_pe.squeeze(1),
+                kv_cache=kv_cache,
+                slot_mapping=slot_mapping.flatten(),
                 kv_cache_dtype=mla.kv_cache_dtype,
                 scale=mla._k_scale,
             )
@@ -306,8 +374,8 @@ def _forked_kimi_mla_attn(
     kv_c = kv_c[:num_actual_toks]
     k_pe = k_pe[:num_actual_toks]
 
-    fp8_attn = is_quantized_kv_cache(mla.kv_cache_dtype)
-    if fp8_attn and mla.kv_cache_dtype != "fp8_ds_mla":
+    assert mla.kv_cache_dtype.startswith("fp8"), "only FP8 KV cache is supported"
+    if mla.kv_cache_dtype != "fp8_ds_mla":
         kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
     assert (
@@ -339,29 +407,15 @@ def _forked_kimi_mla_attn(
         N, B, P = mqa_q_nope.shape
         _, _, L = mla.W_UK_T.shape
 
-        q_pad = mla.q_pad_num_heads
-        if q_pad is not None:
-            mqa_ql_nope = mqa_q_nope.new_empty((q_pad, B, L))
-            mqa_ql_nope.resize_((N, B, L))
-        else:
-            mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
+        assert mla.q_pad_num_heads is None, "num_heads padding is unsupported"
+        mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
 
         torch.bmm(mqa_q_nope, mla.W_UK_T, out=mqa_ql_nope)
         mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-        if q_pad is not None:
-            B_pe, N_pe, L_pe = mqa_q_pe.shape
-            mqa_pe_padded = mqa_q_pe.new_empty((B_pe, q_pad, L_pe))
-            mqa_pe_padded.resize_((B_pe, N_pe, L_pe))
-            mqa_pe_padded.copy_(mqa_q_pe)
-            mqa_q_pe = mqa_pe_padded
-
-        if fp8_attn and mla.impl.supports_quant_query_input:
-            mqa_q_final = mla._decode_concat_quant_fp8_op(
-                mqa_ql_nope, mqa_q_pe, mla._q_scale
-            )
-        else:
-            mqa_q_final = (mqa_ql_nope, mqa_q_pe)
+        mqa_q_final = mla._decode_concat_quant_fp8_op(
+            mqa_ql_nope, mqa_q_pe, mla._q_scale
+        )
 
         decode_attn_out, _ = mla.impl.forward_mqa(
             mqa_q_final, kv_cache, attn_metadata, mla
@@ -561,6 +615,119 @@ def _make_fully_dynamic_cute_tensor(data: torch.Tensor):
 
 def _cuda_device_cache_key() -> int:
     return torch.cuda.current_device() if torch.cuda.is_available() else -1
+
+
+@dsl_user_op
+def _cvt_f32_to_e4m3(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Uint32:
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Float32(a).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b16 fp8_pair;
+                .reg .f32 zero;
+                mov.f32 zero, 0f00000000;
+                cvt.rn.satfinite.e4m3x2.f32 fp8_pair, zero, $1;
+                cvt.u32.u16 $0, fp8_pair;
+            }
+            """,
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.kernel
+def kimik25_concat_and_cache_mla_kernel(
+    kv_c: cute.Tensor,  # (Sp, kv_lora_rank)
+    k_pe: cute.Tensor,  # (Sp, pe_dim)
+    kv_cache: cute.Tensor,  # (num_blocks, block_size, kv_lora_rank + pe_dim)
+    slot_mapping: cute.Tensor,  # (Sp,)
+    scale: cute.Tensor,  # (1,)
+    kv_lora_rank: cutlass.Constexpr,
+    pe_dim: cutlass.Constexpr,
+    kv_cache_block_factor: cutlass.Constexpr,
+):
+    tid, _, _ = cute.arch.thread_idx()
+    token_idx, kv_c_split_idx, _ = cute.arch.block_idx()
+    kv_c_elems_per_split: cutlass.Constexpr = kv_lora_rank // kv_cache_block_factor
+    kv_c_idx = kv_c_split_idx * kv_c_elems_per_split + tid
+
+    slot_idx = slot_mapping[token_idx]
+    if slot_idx >= 0:
+        block_size = kv_cache.shape[1]
+        cache_block_idx = slot_idx // block_size
+        cache_block_offset = slot_idx % block_size
+        scale_value = scale[0].to(cutlass.Float32)
+
+        kv_c_val = kv_c[token_idx, kv_c_idx].to(cutlass.Float32) / scale_value
+        kv_cache[cache_block_idx, cache_block_offset, kv_c_idx] = cutlass.Uint8(
+            _cvt_f32_to_e4m3(kv_c_val) & cutlass.Uint32(0xFF)
+        )
+
+        if kv_c_split_idx == 0 and tid < pe_dim:
+            k_pe_val = k_pe[token_idx, tid].to(cutlass.Float32) / scale_value
+            kv_cache[cache_block_idx, cache_block_offset, kv_lora_rank + tid] = (
+                cutlass.Uint8(_cvt_f32_to_e4m3(k_pe_val) & cutlass.Uint32(0xFF))
+            )
+
+
+@cute.jit
+def kimik25_concat_and_cache_mla(
+    kv_c: cute.Tensor,
+    k_pe: cute.Tensor,
+    kv_cache: cute.Tensor,
+    slot_mapping: cute.Tensor,
+    scale: cute.Tensor,
+    kv_lora_rank: cutlass.Constexpr,
+    pe_dim: cutlass.Constexpr,
+    kv_cache_block_factor: cutlass.Constexpr,
+    stream: CUstream,
+):
+    assert kv_lora_rank == 512
+    assert pe_dim == 64
+    assert kv_cache_block_factor > 0
+    assert kv_lora_rank % kv_cache_block_factor == 0
+    threads_per_block: cutlass.Constexpr = kv_lora_rank // kv_cache_block_factor
+    assert threads_per_block >= pe_dim
+    kv_c = cute.make_tensor(
+        kv_c.iterator,
+        cute.make_layout(
+            (kv_c.shape[0], kv_lora_rank),
+            stride=(kv_c.stride[0], kv_c.stride[1]),
+        ),
+    )
+    k_pe = cute.make_tensor(
+        k_pe.iterator,
+        cute.make_layout(
+            (k_pe.shape[0], pe_dim),
+            stride=(k_pe.stride[0], k_pe.stride[1]),
+        ),
+    )
+    kv_cache = cute.make_tensor(
+        kv_cache.iterator,
+        cute.make_layout(
+            (kv_cache.shape[0], kv_cache.shape[1], kv_lora_rank + pe_dim),
+            stride=(kv_cache.stride[0], kv_cache.stride[1], kv_cache.stride[2]),
+        ),
+    )
+    kimik25_concat_and_cache_mla_kernel(
+        kv_c,
+        k_pe,
+        kv_cache,
+        slot_mapping,
+        scale,
+        kv_lora_rank,
+        pe_dim,
+        kv_cache_block_factor,
+    ).launch(
+        grid=(slot_mapping.shape[0], kv_cache_block_factor, 1),
+        block=(threads_per_block, 1, 1),
+        stream=stream,
+    )
 
 
 @cute.kernel
@@ -817,6 +984,72 @@ def kimik25_rope(
 
 
 kimik25_rmsnorm_special_qkv_split = kimik25_rmsnorm_special_qkv_fused
+
+
+def _run_kimik25_concat_and_cache_mla(
+    *,
+    kv_c: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    scale: torch.Tensor,
+) -> None:
+    assert kv_cache_dtype in {"fp8", "fp8_e4m3"}
+
+    kv_lora_rank = kv_c.shape[1]
+    pe_dim = k_pe.shape[1]
+    assert kv_lora_rank == 512, "Kimi-K2.5 NVFP4 expects kv_lora_rank=512"
+    assert pe_dim == 64, "Kimi-K2.5 NVFP4 expects qk_rope_head_dim=64"
+    kv_cache_block_factor = 4
+    scale = scale.view(1)
+
+    cache_key = (
+        "kimik25_concat_and_cache_mla",
+        _cuda_device_cache_key(),
+        kv_c.dtype,
+        kv_c.ndim,
+        tuple(kv_c.shape[1:]),
+        tuple(kv_c.stride()[1:]),
+        k_pe.dtype,
+        k_pe.ndim,
+        tuple(k_pe.shape[1:]),
+        tuple(k_pe.stride()[1:]),
+        kv_cache.dtype,
+        kv_cache.ndim,
+        tuple(kv_cache.shape[1:]),
+        tuple(kv_cache.stride()[1:]),
+        slot_mapping.dtype,
+        slot_mapping.ndim,
+        tuple(slot_mapping.stride()),
+        scale.dtype,
+        tuple(scale.shape),
+        tuple(scale.stride()),
+        kv_lora_rank,
+        pe_dim,
+        kv_cache_block_factor,
+    )
+    executor = _get_cutedsl_executor(
+        cache_key,
+        kimik25_concat_and_cache_mla,
+        kv_c=_make_dynamic_cute_tensor(kv_c),
+        k_pe=_make_dynamic_cute_tensor(k_pe),
+        kv_cache=_make_dynamic_cute_tensor(kv_cache),
+        slot_mapping=_make_fully_dynamic_cute_tensor(slot_mapping),
+        scale=from_dlpack(scale, assumed_align=4),
+        kv_lora_rank=kv_lora_rank,
+        pe_dim=pe_dim,
+        kv_cache_block_factor=kv_cache_block_factor,
+        stream=cutlass_torch.current_stream(),
+    )
+    executor(
+        kv_c=_make_dynamic_cute_tensor(kv_c),
+        k_pe=_make_dynamic_cute_tensor(k_pe),
+        kv_cache=_make_dynamic_cute_tensor(kv_cache),
+        slot_mapping=_make_fully_dynamic_cute_tensor(slot_mapping),
+        scale=from_dlpack(scale, assumed_align=4),
+        stream=cutlass_torch.current_stream(),
+    )
 
 
 def _run_kimik25_rmsnorm_special_qkv_fused(
@@ -1193,6 +1426,17 @@ class KimiK25ForConditionalGeneration(
         }
     )
 
+    def __new__(
+        cls,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+    ) -> nn.Module:
+        if cls is KimiK25ForConditionalGeneration:
+            reason = _get_kimi_nvfp4_specialization_rejection_reason(vllm_config)
+            if reason is not None:
+                return _fallback_to_generic_kimi_k25(vllm_config, prefix, reason)
+        return super().__new__(cls)
+
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -1202,8 +1446,8 @@ class KimiK25ForConditionalGeneration(
 
         if not _is_target_kimi_nvfp4(vllm_config):
             raise ValueError(
-                "The Kimi-K2.5 specialized NVFP4 model only supports "
-                "`nvidia/Kimi-K2.5-NVFP4`."
+                "The Kimi-K2.5 specialized NVFP4 model was selected despite "
+                "not meeting its runtime requirements."
             )
 
         self.language_model = KimiK25Nvfp4TextForCausalLM(

@@ -36,9 +36,9 @@ import torch
 import torch.distributed as dist
 
 from vllm.config import (
-    CUDAGraphMode,
     CacheConfig,
     CompilationConfig,
+    CUDAGraphMode,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -47,8 +47,8 @@ from vllm.config import (
 )
 from vllm.distributed import (
     cleanup_dist_env_and_memory,
-    graph_capture,
     get_tensor_model_parallel_world_size,
+    graph_capture,
     init_distributed_environment,
     initialize_model_parallel,
     model_parallel_is_initialized,
@@ -211,9 +211,7 @@ def _build_vllm_config(args: argparse.Namespace) -> VllmConfig:
         is_encoder_decoder=False,
         enable_chunked_prefill=True,
     )
-    parallel_config = ParallelConfig(
-        tensor_parallel_size=args.tensor_parallel_size
-    )
+    parallel_config = ParallelConfig(tensor_parallel_size=args.tensor_parallel_size)
     compilation_config = CompilationConfig()
 
     top_level_config = VllmConfig(
@@ -445,8 +443,8 @@ def _build_decode_batch(
         block_idx = token_idx // block_size
         offset_in_block = token_idx % block_size
         slot_mapping[req_idx] = (
-            (current_block + block_idx) * block_size + offset_in_block
-        )
+            current_block + block_idx
+        ) * block_size + offset_in_block
         current_block += num_blocks
 
     common_attn_metadata = CommonAttentionMetadata(
@@ -533,9 +531,7 @@ def _tensor_preview(
         truncated = cpu_tensor.shape[0] > max_elems
     elif cpu_tensor.ndim == 2:
         preview = cpu_tensor[:max_rows, :max_cols].tolist()
-        truncated = (
-            cpu_tensor.shape[0] > max_rows or cpu_tensor.shape[1] > max_cols
-        )
+        truncated = cpu_tensor.shape[0] > max_rows or cpu_tensor.shape[1] > max_cols
     else:
         flat = cpu_tensor.reshape(-1)[:max_elems].tolist()
         preview = flat
@@ -556,10 +552,7 @@ def _tensor_stats_line(name: str, tensor: torch.Tensor | None) -> str:
     min_value = cpu_tensor.min().item()
     mean_value = cpu_tensor.mean().item()
     max_value = cpu_tensor.max().item()
-    return (
-        f"  {name}: min/mean/max="
-        f"{min_value:.1f}/{mean_value:.1f}/{max_value:.1f}"
-    )
+    return f"  {name}: min/mean/max={min_value:.1f}/{mean_value:.1f}/{max_value:.1f}"
 
 
 def _summarize_tensor_finiteness(
@@ -660,10 +653,7 @@ def _summarize_input_tensor_sanity(
 ) -> list[str]:
     lines = [
         "input_tensor_sanity:",
-        (
-            "  kv_b_proj_quant_method: "
-            f"{type(layer.kv_b_proj.quant_method).__name__}"
-        ),
+        (f"  kv_b_proj_quant_method: {type(layer.kv_b_proj.quant_method).__name__}"),
     ]
 
     named_parameters = dict(layer.named_parameters())
@@ -718,6 +708,7 @@ def _summarize_input_tensor_sanity(
         "  kv_cache_interpretation: "
         f"kv_cache_dtype={layer.mla_attn.kv_cache_dtype}, "
         f"is_quantized={kv_cache_is_quantized}, "
+        f"_k_scale_dtype={layer.mla_attn._k_scale.dtype}, "
         f"_k_scale_float={kv_scale:.6f}"
     )
     lines.append(
@@ -763,10 +754,7 @@ def _summarize_mla_forward_context(layer_name: str) -> list[str]:
         "mla_forward_context:",
         f"  target_layer: {layer_name}",
         f"  cudagraph_runtime_mode: {forward_context.cudagraph_runtime_mode}",
-        (
-            "  batch_descriptor: "
-            f"{forward_context.batch_descriptor!r}"
-        ),
+        (f"  batch_descriptor: {forward_context.batch_descriptor!r}"),
         (
             "  no_compile_layers: "
             f"count={len(forward_context.no_compile_layers)}, "
@@ -863,7 +851,10 @@ def _make_attention_layer(
             prefix=spec.prefix,
         )
 
-    layer = layer.to(device=device, dtype=model_dtype).eval()
+    # Parameters are created under `set_default_torch_dtype(model_dtype)`.
+    # Move to CUDA without a dtype cast so quantization scale buffers stay fp32;
+    # the cache-update kernels read those scale tensors as float storage.
+    layer = layer.to(device=device).eval()
     if source_layer is None:
         _initialize_random_weights(layer)
     else:
@@ -1119,10 +1110,7 @@ def _print_variant_result(
     )
     for line in result.mla_forward_context_lines:
         print(line)
-    print(
-        "output: "
-        f"shape={tuple(result.output.shape)}, dtype={result.output.dtype}"
-    )
+    print(f"output: shape={tuple(result.output.shape)}, dtype={result.output.dtype}")
     print(
         _format_tensor_finiteness(
             "output_values",

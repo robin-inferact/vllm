@@ -49,6 +49,8 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.flashinfer import flashinfer_scaled_fp4_mm
 from vllm.utils.torch_utils import (
+    aux_stream,
+    current_stream,
     direct_register_custom_op,
     is_quantized_kv_cache,
 )
@@ -327,6 +329,50 @@ def _forked_kimi_mla_attn(
     )
 
     q_c, kv_c = qkv_c.split([layer.q_lora_rank, layer.kv_lora_rank], dim=-1)
+    k_pe_cache = k_pe
+
+    fwd_ctx = get_forward_context()
+    if fwd_ctx.attn_metadata is None:
+        output.zero_()
+        return output
+    attn_metadata = fwd_ctx.attn_metadata.get(mla.layer_name)
+
+    num_actual_toks = attn_metadata.num_actual_tokens
+    if num_actual_toks == 0:
+        output.zero_()
+        return output
+
+    kv_cache = mla.kv_cache
+    slot_mapping = None
+    if kv_cache.numel() > 0:
+        slot_mapping = fwd_ctx.slot_mapping.get(mla.layer_name)
+        if slot_mapping is not None:
+            slot_mapping = slot_mapping.flatten()
+
+    cache_stream = aux_stream()
+    main_stream = current_stream()
+
+    # After the fused q/kv RMSNorm, the K/V cache update is independent of the
+    # q_b projection and Q RoPE, so launch it early when an aux stream exists.
+    def run_concat_and_cache_mla() -> None:
+        assert slot_mapping is not None
+        _run_kimik25_concat_and_cache_mla(
+            positions=positions,
+            kv_c=kv_c,
+            k_pe=k_pe_cache,
+            kv_cache=kv_cache,
+            cos_sin_cache=layer.rotary_emb.cos_sin_cache,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype=mla.kv_cache_dtype,
+            scale=mla._k_scale,
+        )
+
+    if not torch.cuda.is_current_stream_capturing():
+        qkv_a.record_stream(cache_stream)
+    cache_stream.wait_stream(main_stream)
+    with torch.cuda.stream(cache_stream):
+        run_concat_and_cache_mla()
+
     q, _ = layer.q_b_proj(q_c)
 
     q = q.view(-1, layer.num_local_heads, layer.qk_head_dim)
@@ -342,31 +388,7 @@ def _forked_kimi_mla_attn(
         layer.qk_rope_head_dim // 2,
     )
 
-    fwd_ctx = get_forward_context()
-    if fwd_ctx.attn_metadata is None:
-        output.zero_()
-        return output
-    attn_metadata = fwd_ctx.attn_metadata.get(mla.layer_name)
-
-    num_actual_toks = attn_metadata.num_actual_tokens
-    if num_actual_toks == 0:
-        output.zero_()
-        return output
-
-    kv_cache = mla.kv_cache
-    if kv_cache.numel() > 0:
-        slot_mapping = fwd_ctx.slot_mapping.get(mla.layer_name)
-        if slot_mapping is not None:
-            _run_kimik25_concat_and_cache_mla(
-                positions=positions,
-                kv_c=kv_c,
-                k_pe=k_pe.squeeze(1),
-                kv_cache=kv_cache,
-                cos_sin_cache=layer.rotary_emb.cos_sin_cache,
-                slot_mapping=slot_mapping.flatten(),
-                kv_cache_dtype=mla.kv_cache_dtype,
-                scale=mla._k_scale,
-            )
+    main_stream.wait_stream(cache_stream)
 
     if mla.impl.dcp_world_size == -1:
         from vllm.distributed.parallel_state import get_dcp_group

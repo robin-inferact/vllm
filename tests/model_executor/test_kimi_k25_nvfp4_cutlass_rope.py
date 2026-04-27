@@ -21,7 +21,6 @@ cutlass_torch = pytest.importorskip("cutlass.torch")
 from_dlpack = pytest.importorskip("cutlass.cute.runtime").from_dlpack
 
 QK_NOPE_HEAD_DIM = 128
-KV_LORA_RANK = 512
 QK_ROPE_HEAD_DIM = 64
 NUM_LOCAL_HEADS = 64
 MAX_POSITION = 262144
@@ -38,10 +37,10 @@ ROPE_PARAMETERS = {
 }
 
 
-def _make_mla_like_qk_views(
+def _make_mla_like_query_view(
     num_tokens: int,
     dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     query_base = torch.randn(
         num_tokens,
         NUM_LOCAL_HEADS,
@@ -49,15 +48,8 @@ def _make_mla_like_qk_views(
         device="cuda",
         dtype=dtype,
     )
-    key_base = torch.randn(
-        num_tokens,
-        KV_LORA_RANK + QK_ROPE_HEAD_DIM,
-        device="cuda",
-        dtype=dtype,
-    )
     query = query_base[..., QK_NOPE_HEAD_DIM:]
-    key = key_base[..., KV_LORA_RANK:].unsqueeze(1)
-    return query, key
+    return query
 
 
 @pytest.mark.parametrize("num_tokens", [13, 64])
@@ -84,24 +76,28 @@ def test_kimik25_cutlass_rope_matches_pytorch_reference(
         dtype=torch.long,
     )
 
-    ref_query, ref_key = _make_mla_like_qk_views(num_tokens, torch.bfloat16)
-    expected_query, expected_key = rope.forward_native(positions, ref_query, ref_key)
+    ref_query = _make_mla_like_query_view(num_tokens, torch.bfloat16)
+    ref_key = torch.empty(
+        num_tokens,
+        1,
+        QK_ROPE_HEAD_DIM,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    expected_query, _ = rope.forward_native(positions, ref_query, ref_key)
 
-    actual_query, actual_key = _make_mla_like_qk_views(num_tokens, torch.bfloat16)
+    actual_query = _make_mla_like_query_view(num_tokens, torch.bfloat16)
     actual_query.copy_(ref_query)
-    actual_key.copy_(ref_key)
 
     assert actual_query.stride() == (
         NUM_LOCAL_HEADS * (QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM),
         QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM,
         1,
     )
-    assert actual_key.stride() == (KV_LORA_RANK + QK_ROPE_HEAD_DIM, QK_ROPE_HEAD_DIM, 1)
 
     kimik25_rope(
         from_dlpack(positions),
         from_dlpack(actual_query).mark_layout_dynamic(),
-        from_dlpack(actual_key),
         from_dlpack(rope.cos_sin_cache),
         NUM_LOCAL_HEADS,
         QK_ROPE_HEAD_DIM // 2,
@@ -109,7 +105,6 @@ def test_kimik25_cutlass_rope_matches_pytorch_reference(
     )
     torch.cuda.synchronize()
 
-    assert expected_key is not None
     # The Cutlass kernel uses Blackwell bf16 arithmetic directly, which differs
     # from vLLM's PyTorch-native reference by about two bf16 ULPs in practice.
     torch.testing.assert_close(
@@ -117,10 +112,4 @@ def test_kimik25_cutlass_rope_matches_pytorch_reference(
         expected_query,
         atol=max(get_default_atol(actual_query), KERNEL_ATOL),
         rtol=get_default_rtol(actual_query),
-    )
-    torch.testing.assert_close(
-        actual_key,
-        expected_key,
-        atol=max(get_default_atol(actual_key), KERNEL_ATOL),
-        rtol=get_default_rtol(actual_key),
     )

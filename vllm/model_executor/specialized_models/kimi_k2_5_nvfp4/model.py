@@ -337,7 +337,6 @@ def _forked_kimi_mla_attn(
     _run_kimik25_rope(
         positions,
         q_pe,
-        k_pe,
         layer.rotary_emb.cos_sin_cache,
         layer.num_local_heads,
         layer.qk_rope_head_dim // 2,
@@ -359,9 +358,11 @@ def _forked_kimi_mla_attn(
         slot_mapping = fwd_ctx.slot_mapping.get(mla.layer_name)
         if slot_mapping is not None:
             _run_kimik25_concat_and_cache_mla(
+                positions=positions,
                 kv_c=kv_c,
                 k_pe=k_pe.squeeze(1),
                 kv_cache=kv_cache,
+                cos_sin_cache=layer.rotary_emb.cos_sin_cache,
                 slot_mapping=slot_mapping.flatten(),
                 kv_cache_dtype=mla.kv_cache_dtype,
                 scale=mla._k_scale,
@@ -650,9 +651,11 @@ def _cvt_f32_to_e4m3(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Uint32
 
 @cute.kernel
 def kimik25_concat_and_cache_mla_kernel(
+    positions: cute.Tensor,  # (Sp,)
     kv_c: cute.Tensor,  # (Sp, kv_lora_rank)
     k_pe: cute.Tensor,  # (Sp, pe_dim)
     kv_cache: cute.Tensor,  # (num_blocks, block_size, kv_lora_rank + pe_dim)
+    cos_sin_cache: cute.Tensor,  # (max_position_embeddings, pe_dim)
     slot_mapping: cute.Tensor,  # (Sp,)
     scale: cute.Tensor,  # (1,)
     kv_lora_rank: cutlass.Constexpr,
@@ -660,9 +663,8 @@ def kimik25_concat_and_cache_mla_kernel(
     kv_cache_block_factor: cutlass.Constexpr,
 ):
     tid, _, _ = cute.arch.thread_idx()
-    token_idx, kv_c_split_idx, _ = cute.arch.block_idx()
+    token_idx, split_idx, _ = cute.arch.block_idx()
     kv_c_elems_per_split: cutlass.Constexpr = kv_lora_rank // kv_cache_block_factor
-    kv_c_idx = kv_c_split_idx * kv_c_elems_per_split + tid
 
     slot_idx = slot_mapping[token_idx]
     if slot_idx >= 0:
@@ -671,23 +673,56 @@ def kimik25_concat_and_cache_mla_kernel(
         cache_block_offset = slot_idx % block_size
         scale_value = scale[0].to(cutlass.Float32)
 
-        kv_c_val = kv_c[token_idx, kv_c_idx].to(cutlass.Float32) / scale_value
-        kv_cache[cache_block_idx, cache_block_offset, kv_c_idx] = cutlass.Uint8(
-            _cvt_f32_to_e4m3(kv_c_val) & cutlass.Uint32(0xFF)
-        )
-
-        if kv_c_split_idx == 0 and tid < pe_dim:
-            k_pe_val = k_pe[token_idx, tid].to(cutlass.Float32) / scale_value
-            kv_cache[cache_block_idx, cache_block_offset, kv_lora_rank + tid] = (
-                cutlass.Uint8(_cvt_f32_to_e4m3(k_pe_val) & cutlass.Uint32(0xFF))
+        if split_idx > 0:
+            kv_c_idx = (split_idx - 1) * kv_c_elems_per_split + tid
+            kv_c_val = kv_c[token_idx, kv_c_idx].to(cutlass.Float32) / scale_value
+            kv_cache[cache_block_idx, cache_block_offset, kv_c_idx] = cutlass.Uint8(
+                _cvt_f32_to_e4m3(kv_c_val) & cutlass.Uint32(0xFF)
             )
+        else:
+            in_scratch = cute.make_rmem_tensor(2, dtype=cutlass.BFloat16)
+            out_scratch = cute.make_rmem_tensor(2, dtype=cutlass.Uint8)
+            half_pe_dim: cutlass.Constexpr = pe_dim // 2
+            if tid < half_pe_dim:
+                pos = positions[token_idx]
+                cos = cos_sin_cache[pos, tid]
+                sin = cos_sin_cache[pos, tid + half_pe_dim]
+                cute.autovec_copy(k_pe[token_idx, (None, tid)], in_scratch)
+                a, b = in_scratch[0], in_scratch[1]
+                ap = (a * cos - b * sin).to(cutlass.BFloat16)
+                bp = (a * sin + b * cos).to(cutlass.BFloat16)
+                in_scratch[0] = ap
+                in_scratch[1] = bp
+                cute.autovec_copy(in_scratch, k_pe[token_idx, (None, tid)])
+                k_pe_x_val = ap.to(cutlass.Float32) / scale_value
+                k_pe_y_val = bp.to(cutlass.Float32) / scale_value
+                out_scratch[0] = cutlass.Uint8(
+                    _cvt_f32_to_e4m3(k_pe_x_val) & cutlass.Uint32(0xFF)
+                )
+                out_scratch[1] = cutlass.Uint8(
+                    _cvt_f32_to_e4m3(k_pe_y_val) & cutlass.Uint32(0xFF)
+                )
+                kv_cache_divided = cute.logical_divide(
+                    kv_cache,
+                    (1, 1, 2),
+                )
+                cute.autovec_copy(
+                    out_scratch,
+                    kv_cache_divided[
+                        cache_block_idx,
+                        cache_block_offset,
+                        (None, kv_lora_rank // 2 + tid),
+                    ],
+                )
 
 
 @cute.jit
 def kimik25_concat_and_cache_mla(
+    positions: cute.Tensor,
     kv_c: cute.Tensor,
     k_pe: cute.Tensor,
     kv_cache: cute.Tensor,
+    cos_sin_cache: cute.Tensor,
     slot_mapping: cute.Tensor,
     scale: cute.Tensor,
     kv_lora_rank: cutlass.Constexpr,
@@ -697,42 +732,48 @@ def kimik25_concat_and_cache_mla(
 ):
     assert kv_lora_rank == 512
     assert pe_dim == 64
+    assert pe_dim % 2 == 0
     assert kv_cache_block_factor > 0
     assert kv_lora_rank % kv_cache_block_factor == 0
     threads_per_block: cutlass.Constexpr = kv_lora_rank // kv_cache_block_factor
     assert threads_per_block >= pe_dim
+    assert kv_c.stride[1] == 1
+    assert k_pe.stride[1] == 1
+    assert kv_cache.stride[2] == 1
     kv_c = cute.make_tensor(
         kv_c.iterator,
         cute.make_layout(
             (kv_c.shape[0], kv_lora_rank),
-            stride=(kv_c.stride[0], kv_c.stride[1]),
+            stride=(kv_c.stride[0], 1),
         ),
     )
     k_pe = cute.make_tensor(
         k_pe.iterator,
         cute.make_layout(
-            (k_pe.shape[0], pe_dim),
-            stride=(k_pe.stride[0], k_pe.stride[1]),
+            (k_pe.shape[0], (2, pe_dim // 2)),
+            stride=(cute.assume(k_pe.stride[0], divby=2), (1, 2)),
         ),
     )
     kv_cache = cute.make_tensor(
         kv_cache.iterator,
         cute.make_layout(
             (kv_cache.shape[0], kv_cache.shape[1], kv_lora_rank + pe_dim),
-            stride=(kv_cache.stride[0], kv_cache.stride[1], kv_cache.stride[2]),
+            stride=(kv_cache.stride[0], kv_cache.stride[1], 1),
         ),
     )
     kimik25_concat_and_cache_mla_kernel(
+        positions,
         kv_c,
         k_pe,
         kv_cache,
+        cos_sin_cache,
         slot_mapping,
         scale,
         kv_lora_rank,
         pe_dim,
         kv_cache_block_factor,
     ).launch(
-        grid=(slot_mapping.shape[0], kv_cache_block_factor, 1),
+        grid=(slot_mapping.shape[0], kv_cache_block_factor + 1, 1),
         block=(threads_per_block, 1, 1),
         stream=stream,
     )
@@ -927,7 +968,6 @@ def kimik25_rmsnorm_special_qkv_fused(
 def kimik25_rope_kernel(
     positions: cute.Tensor,  # (Sp,)
     query: cute.Tensor,  # (Sp, (K, N_local // K), (2, R // 2))
-    key: cute.Tensor,  # (Sp, 1, (2, R // 2))
     cos_sin_cache: cute.Tensor,  # (max_position_embeddings, R)
     K: cutlass.Constexpr,
 ):
@@ -938,32 +978,20 @@ def kimik25_rope_kernel(
 
     pos = positions[bidx]
     cos, sin = cos_sin_cache[pos, tidx], cos_sin_cache[pos, tidx + 32]
-    if bidy > 0:
-        for i in cutlass.range_constexpr(K):
-            cute.autovec_copy(
-                query[bidx, (i, bidy - 1), (None, tidx)], scratch[None, i]
-            )
+    for i in cutlass.range_constexpr(K):
+        cute.autovec_copy(query[bidx, (i, bidy), (None, tidx)], scratch[None, i])
 
-        for i in cutlass.range_constexpr(K):
-            a, b = scratch[0, i], scratch[1, i]
-            scratch[0, i] = a * cos - b * sin
-            scratch[1, i] = a * sin + b * cos
-            cute.autovec_copy(
-                scratch[None, i], query[bidx, (i, bidy - 1), (None, tidx)]
-            )
-    else:
-        cute.autovec_copy(key[bidx, 0, (None, tidx)], scratch[None, 0])
-        a, b = scratch[0], scratch[1]
-        scratch[0] = a * cos - b * sin
-        scratch[1] = a * sin + b * cos
-        cute.autovec_copy(scratch[None, 0], key[bidx, 0, (None, tidx)])
+    for i in cutlass.range_constexpr(K):
+        a, b = scratch[0, i], scratch[1, i]
+        scratch[0, i] = a * cos - b * sin
+        scratch[1, i] = a * sin + b * cos
+        cute.autovec_copy(scratch[None, i], query[bidx, (i, bidy), (None, tidx)])
 
 
 @cute.jit
 def kimik25_rope(
     positions: cute.Tensor,  # (Sp,)
     query: cute.Tensor,  # (Sp, N_local, R):(?, ?, 1)
-    key: cute.Tensor,  # (Sp, 1, R)
     cos_sin_cache: cute.Tensor,  # (max_position_embeddings, R)
     N_local: cutlass.Constexpr,
     half_rope_dim: cutlass.Constexpr,
@@ -983,9 +1011,8 @@ def kimik25_rope(
             ),
         ),
     )
-    key = cute.logical_divide(key, (1, 1, 2))[(0, None), (0, None), None]
-    kimik25_rope_kernel(positions, query, key, cos_sin_cache, K).launch(
-        grid=(sp, N_local // K + 1, 1),
+    kimik25_rope_kernel(positions, query, cos_sin_cache, K).launch(
+        grid=(sp, N_local // K, 1),
         block=(half_rope_dim, 1, 1),
         stream=stream,
     )
@@ -996,9 +1023,11 @@ kimik25_rmsnorm_special_qkv_split = kimik25_rmsnorm_special_qkv_fused
 
 def _run_kimik25_concat_and_cache_mla(
     *,
+    positions: torch.Tensor,
     kv_c: torch.Tensor,
     k_pe: torch.Tensor,
     kv_cache: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     kv_cache_dtype: str,
     scale: torch.Tensor,
@@ -1012,17 +1041,21 @@ def _run_kimik25_concat_and_cache_mla(
     kv_cache_block_factor = 4
     scale = scale.view(1)
 
+    positions_cute = _make_fully_dynamic_cute_tensor(positions)
     kv_c_cute = _make_dynamic_cute_tensor(kv_c)
     k_pe_cute = _make_dynamic_cute_tensor(k_pe)
     kv_cache_cute = _make_dynamic_cute_tensor(kv_cache)
+    cos_sin_cache_cute = from_dlpack(cos_sin_cache, assumed_align=16)
     slot_mapping_cute = _make_fully_dynamic_cute_tensor(slot_mapping)
     scale_cute = from_dlpack(scale, assumed_align=4)
     cache_key = (
         "kimik25_concat_and_cache_mla",
         _cuda_device_cache_key(),
+        _cutedsl_arg_cache_key(positions_cute),
         _cutedsl_arg_cache_key(kv_c_cute),
         _cutedsl_arg_cache_key(k_pe_cute),
         _cutedsl_arg_cache_key(kv_cache_cute),
+        _cutedsl_arg_cache_key(cos_sin_cache_cute),
         _cutedsl_arg_cache_key(slot_mapping_cute),
         _cutedsl_arg_cache_key(scale_cute),
         kv_lora_rank,
@@ -1032,9 +1065,11 @@ def _run_kimik25_concat_and_cache_mla(
     executor = _get_cutedsl_executor(
         cache_key,
         kimik25_concat_and_cache_mla,
+        positions=positions_cute,
         kv_c=kv_c_cute,
         k_pe=k_pe_cute,
         kv_cache=kv_cache_cute,
+        cos_sin_cache=cos_sin_cache_cute,
         slot_mapping=slot_mapping_cute,
         scale=scale_cute,
         kv_lora_rank=kv_lora_rank,
@@ -1043,9 +1078,11 @@ def _run_kimik25_concat_and_cache_mla(
         stream=cutlass_torch.current_stream(),
     )
     executor(
+        positions=positions_cute,
         kv_c=kv_c_cute,
         k_pe=k_pe_cute,
         kv_cache=kv_cache_cute,
+        cos_sin_cache=cos_sin_cache_cute,
         slot_mapping=slot_mapping_cute,
         scale=scale_cute,
         stream=cutlass_torch.current_stream(),
@@ -1099,21 +1136,18 @@ def _run_kimik25_rmsnorm_special_qkv_fused(
 def _run_kimik25_rope(
     positions: torch.Tensor,
     query: torch.Tensor,
-    key: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     num_local_heads: int,
     half_rope_dim: int,
 ) -> None:
     positions_cute = _make_fully_dynamic_cute_tensor(positions)
     query_cute = _make_fully_dynamic_cute_tensor(query)
-    key_cute = _make_fully_dynamic_cute_tensor(key)
     cos_sin_cache_cute = from_dlpack(cos_sin_cache, assumed_align=16)
     cache_key = (
         "kimik25_rope",
         _cuda_device_cache_key(),
         _cutedsl_arg_cache_key(positions_cute),
         _cutedsl_arg_cache_key(query_cute),
-        _cutedsl_arg_cache_key(key_cute),
         _cutedsl_arg_cache_key(cos_sin_cache_cute),
         num_local_heads,
         half_rope_dim,
@@ -1123,7 +1157,6 @@ def _run_kimik25_rope(
         kimik25_rope,
         positions=positions_cute,
         query=query_cute,
-        key=key_cute,
         cos_sin_cache=cos_sin_cache_cute,
         N_local=num_local_heads,
         half_rope_dim=half_rope_dim,
@@ -1132,7 +1165,6 @@ def _run_kimik25_rope(
     executor(
         positions=positions_cute,
         query=query_cute,
-        key=key_cute,
         cos_sin_cache=cos_sin_cache_cute,
         stream=cutlass_torch.current_stream(),
     )

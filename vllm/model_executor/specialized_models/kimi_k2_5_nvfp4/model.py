@@ -606,6 +606,11 @@ def _get_cutedsl_executor(
     return executor
 
 
+def _cutedsl_arg_cache_key(arg: Any) -> Any:
+    cache_key = getattr(arg, "__cache_key__", None)
+    return arg if cache_key is None else cache_key
+
+
 def _make_dynamic_cute_tensor(data: torch.Tensor):
     return from_dlpack(data, assumed_align=16).mark_layout_dynamic(
         leading_dim=cutlass_torch.get_leading_dim(data)
@@ -1007,27 +1012,19 @@ def _run_kimik25_concat_and_cache_mla(
     kv_cache_block_factor = 4
     scale = scale.view(1)
 
+    kv_c_cute = _make_dynamic_cute_tensor(kv_c)
+    k_pe_cute = _make_dynamic_cute_tensor(k_pe)
+    kv_cache_cute = _make_dynamic_cute_tensor(kv_cache)
+    slot_mapping_cute = _make_fully_dynamic_cute_tensor(slot_mapping)
+    scale_cute = from_dlpack(scale, assumed_align=4)
     cache_key = (
         "kimik25_concat_and_cache_mla",
         _cuda_device_cache_key(),
-        kv_c.dtype,
-        kv_c.ndim,
-        tuple(kv_c.shape[1:]),
-        tuple(kv_c.stride()[1:]),
-        k_pe.dtype,
-        k_pe.ndim,
-        tuple(k_pe.shape[1:]),
-        tuple(k_pe.stride()[1:]),
-        kv_cache.dtype,
-        kv_cache.ndim,
-        tuple(kv_cache.shape[1:]),
-        tuple(kv_cache.stride()[1:]),
-        slot_mapping.dtype,
-        slot_mapping.ndim,
-        tuple(slot_mapping.stride()),
-        scale.dtype,
-        tuple(scale.shape),
-        tuple(scale.stride()),
+        _cutedsl_arg_cache_key(kv_c_cute),
+        _cutedsl_arg_cache_key(k_pe_cute),
+        _cutedsl_arg_cache_key(kv_cache_cute),
+        _cutedsl_arg_cache_key(slot_mapping_cute),
+        _cutedsl_arg_cache_key(scale_cute),
         kv_lora_rank,
         pe_dim,
         kv_cache_block_factor,
@@ -1035,22 +1032,22 @@ def _run_kimik25_concat_and_cache_mla(
     executor = _get_cutedsl_executor(
         cache_key,
         kimik25_concat_and_cache_mla,
-        kv_c=_make_dynamic_cute_tensor(kv_c),
-        k_pe=_make_dynamic_cute_tensor(k_pe),
-        kv_cache=_make_dynamic_cute_tensor(kv_cache),
-        slot_mapping=_make_fully_dynamic_cute_tensor(slot_mapping),
-        scale=from_dlpack(scale, assumed_align=4),
+        kv_c=kv_c_cute,
+        k_pe=k_pe_cute,
+        kv_cache=kv_cache_cute,
+        slot_mapping=slot_mapping_cute,
+        scale=scale_cute,
         kv_lora_rank=kv_lora_rank,
         pe_dim=pe_dim,
         kv_cache_block_factor=kv_cache_block_factor,
         stream=cutlass_torch.current_stream(),
     )
     executor(
-        kv_c=_make_dynamic_cute_tensor(kv_c),
-        k_pe=_make_dynamic_cute_tensor(k_pe),
-        kv_cache=_make_dynamic_cute_tensor(kv_cache),
-        slot_mapping=_make_fully_dynamic_cute_tensor(slot_mapping),
-        scale=from_dlpack(scale, assumed_align=4),
+        kv_c=kv_c_cute,
+        k_pe=k_pe_cute,
+        kv_cache=kv_cache_cute,
+        slot_mapping=slot_mapping_cute,
+        scale=scale_cute,
         stream=cutlass_torch.current_stream(),
     )
 
@@ -1065,19 +1062,15 @@ def _run_kimik25_rmsnorm_special_qkv_fused(
     eps_q: float,
     eps_kv: float,
 ) -> None:
+    data_cute = _make_dynamic_cute_tensor(data)
+    weights_q_cute = from_dlpack(weights_q, assumed_align=16)
+    weights_kv_cute = from_dlpack(weights_kv, assumed_align=16)
     cache_key = (
         "kimik25_rmsnorm_special_qkv_fused",
         _cuda_device_cache_key(),
-        data.dtype,
-        data.ndim,
-        tuple(data.shape[1:]),
-        tuple(data.stride()[1:]),
-        weights_q.dtype,
-        tuple(weights_q.shape),
-        tuple(weights_q.stride()),
-        weights_kv.dtype,
-        tuple(weights_kv.shape),
-        tuple(weights_kv.stride()),
+        _cutedsl_arg_cache_key(data_cute),
+        _cutedsl_arg_cache_key(weights_q_cute),
+        _cutedsl_arg_cache_key(weights_kv_cute),
         lora_dim_q,
         lora_dim_kv,
         float(eps_q),
@@ -1086,9 +1079,9 @@ def _run_kimik25_rmsnorm_special_qkv_fused(
     executor = _get_cutedsl_executor(
         cache_key,
         kimik25_rmsnorm_special_qkv_fused,
-        data=_make_dynamic_cute_tensor(data),
-        weights_q=from_dlpack(weights_q, assumed_align=16),
-        weights_kv=from_dlpack(weights_kv, assumed_align=16),
+        data=data_cute,
+        weights_q=weights_q_cute,
+        weights_kv=weights_kv_cute,
         lora_dim_q=lora_dim_q,
         lora_dim_kv=lora_dim_kv,
         eps_q=eps_q,
@@ -1096,9 +1089,9 @@ def _run_kimik25_rmsnorm_special_qkv_fused(
         stream=cutlass_torch.current_stream(),
     )
     executor(
-        data=_make_dynamic_cute_tensor(data),
-        weights_q=from_dlpack(weights_q, assumed_align=16),
-        weights_kv=from_dlpack(weights_kv, assumed_align=16),
+        data=data_cute,
+        weights_q=weights_q_cute,
+        weights_kv=weights_kv_cute,
         stream=cutlass_torch.current_stream(),
     )
 
@@ -1111,42 +1104,36 @@ def _run_kimik25_rope(
     num_local_heads: int,
     half_rope_dim: int,
 ) -> None:
+    positions_cute = _make_fully_dynamic_cute_tensor(positions)
+    query_cute = _make_fully_dynamic_cute_tensor(query)
+    key_cute = _make_fully_dynamic_cute_tensor(key)
+    cos_sin_cache_cute = from_dlpack(cos_sin_cache, assumed_align=16)
     cache_key = (
         "kimik25_rope",
         _cuda_device_cache_key(),
-        positions.dtype,
-        positions.ndim,
-        tuple(positions.stride()),
-        query.dtype,
-        query.ndim,
-        tuple(query.shape[1:]),
-        tuple(query.stride()[2:]),
-        key.dtype,
-        key.ndim,
-        tuple(key.shape[1:]),
-        tuple(key.stride()[2:]),
-        cos_sin_cache.dtype,
-        tuple(cos_sin_cache.shape),
-        tuple(cos_sin_cache.stride()),
+        _cutedsl_arg_cache_key(positions_cute),
+        _cutedsl_arg_cache_key(query_cute),
+        _cutedsl_arg_cache_key(key_cute),
+        _cutedsl_arg_cache_key(cos_sin_cache_cute),
         num_local_heads,
         half_rope_dim,
     )
     executor = _get_cutedsl_executor(
         cache_key,
         kimik25_rope,
-        positions=_make_fully_dynamic_cute_tensor(positions),
-        query=_make_fully_dynamic_cute_tensor(query),
-        key=_make_fully_dynamic_cute_tensor(key),
-        cos_sin_cache=from_dlpack(cos_sin_cache, assumed_align=16),
+        positions=positions_cute,
+        query=query_cute,
+        key=key_cute,
+        cos_sin_cache=cos_sin_cache_cute,
         N_local=num_local_heads,
         half_rope_dim=half_rope_dim,
         stream=cutlass_torch.current_stream(),
     )
     executor(
-        positions=_make_fully_dynamic_cute_tensor(positions),
-        query=_make_fully_dynamic_cute_tensor(query),
-        key=_make_fully_dynamic_cute_tensor(key),
-        cos_sin_cache=from_dlpack(cos_sin_cache, assumed_align=16),
+        positions=positions_cute,
+        query=query_cute,
+        key=key_cute,
+        cos_sin_cache=cos_sin_cache_cute,
         stream=cutlass_torch.current_stream(),
     )
 

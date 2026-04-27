@@ -3,11 +3,18 @@
 """Text-only specialized Kimi-K2.5 NVFP4 implementation."""
 
 from collections.abc import Iterable
+from typing import Any
 
+import cutlass
+import cutlass.cute as cute
+import cutlass.torch as cutlass_torch
 import torch
+from cuda.bindings.driver import CUstream
+from cutlass.cute.runtime import from_dlpack
 from torch import nn
 
 from vllm import _custom_ops as ops
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
@@ -241,64 +248,44 @@ def _forked_kimi_mla_attn(
         dim=-1,
     )
 
-    qkv_c_cute = from_dlpack(qkv_c, assumed_align=16).mark_layout_dynamic()
-    q_c_layernorm_weights_cute = from_dlpack(layer.q_a_layernorm.weight.detach(), assumed_align=16)
-    kv_c_layernorm_weights_cute = from_dlpack(layer.kv_a_layernorm.weight.detach(), assumed_align=16)
-    kimik25_rmsnorm_special_qkv_fused(
-        data=qkv_c_cute,
-        weights_q=q_c_layernorm_weights_cute,
-        weights_kv=kv_c_layernorm_weights_cute,
+    _run_kimik25_rmsnorm_special_qkv_fused(
+        data=qkv_c,
+        weights_q=layer.q_a_layernorm.weight.detach(),
+        weights_kv=layer.kv_a_layernorm.weight.detach(),
         lora_dim_q=layer.q_a_layernorm.hidden_size,
         lora_dim_kv=layer.kv_a_layernorm.hidden_size,
         eps_q=layer.q_a_layernorm.variance_epsilon,
         eps_kv=layer.kv_a_layernorm.variance_epsilon,
-        stream=cutlass.torch.current_stream(),
     )
 
     q_c, kv_c = qkv_c.split([layer.q_lora_rank, layer.kv_lora_rank], dim=-1)
     q, _ = layer.q_b_proj(q_c)
 
     q = q.view(-1, layer.num_local_heads, layer.qk_head_dim)
-    q_pe = q[..., layer.qk_nope_head_dim:]
+    q_pe = q[..., layer.qk_nope_head_dim :]
     k_pe = k_pe.unsqueeze(1)
 
     assert q_pe.dtype == layer.rotary_emb.cos_sin_cache.dtype
-    positions_cute = from_dlpack(positions)
-    q_pe_cute = from_dlpack(q_pe, assumed_align=16).mark_layout_dynamic()
-    k_pe_cute = from_dlpack(k_pe, assumed_align=16)
-    cos_sin_cache_cute = from_dlpack(layer.rotary_emb.cos_sin_cache)
-    kimik25_rope(
-        positions_cute,
-        q_pe_cute,
-        k_pe_cute,
-        cos_sin_cache_cute,
+    _run_kimik25_rope(
+        positions,
+        q_pe,
+        k_pe,
+        layer.rotary_emb.cos_sin_cache,
         layer.num_local_heads,
         layer.qk_rope_head_dim // 2,
-        cutlass.torch.current_stream(),
     )
 
     fwd_ctx = get_forward_context()
-    attn_metadata = fwd_ctx.attn_metadata
-    if isinstance(attn_metadata, dict):
-        attn_metadata = attn_metadata.get(mla.layer_name)
-
-    if attn_metadata is None:
-        output.zero_()
-        return output
+    attn_metadata = fwd_ctx.attn_metadata.get(mla.layer_name)
 
     num_actual_toks = attn_metadata.num_actual_tokens
     if num_actual_toks == 0:
         output.zero_()
         return output
 
-    if mla.calculate_kv_scales:
-        mla.calc_kv_scales(q, kv_c, k_pe)
-
     kv_cache = mla.kv_cache
     if kv_cache.numel() > 0:
-        slot_mapping = fwd_ctx.slot_mapping
-        if isinstance(slot_mapping, dict):
-            slot_mapping = slot_mapping.get(mla.layer_name)
+        slot_mapping = fwd_ctx.slot_mapping.get(mla.layer_name)
         if slot_mapping is not None:
             ops.concat_and_cache_mla(
                 kv_c,
@@ -542,15 +529,44 @@ class KimiK25Nvfp4MLAAttention(nn.Module):
         return self.o_proj(attn_out)[0]
 
 
-import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack, make_ptr
-from cuda.bindings.driver import CUstream
+_CUTEDSL_EXECUTOR_CACHE: dict[tuple[Any, ...], Any] = {}
+
+
+def _get_cutedsl_executor(
+    cache_key: tuple[Any, ...],
+    jit_fn: Any,
+    **compile_kwargs: Any,
+) -> Any:
+    executor = _CUTEDSL_EXECUTOR_CACHE.get(cache_key)
+    if executor is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "CuTeDSL executor cache miss during CUDA graph capture for "
+                f"{cache_key[0]!r}. Run an eager warmup before capture."
+            )
+        executor = cute.compile(jit_fn, **compile_kwargs).to(None)
+        _CUTEDSL_EXECUTOR_CACHE[cache_key] = executor
+    return executor
+
+
+def _make_dynamic_cute_tensor(data: torch.Tensor):
+    return from_dlpack(data, assumed_align=16).mark_layout_dynamic(
+        leading_dim=cutlass_torch.get_leading_dim(data)
+    )
+
+
+def _make_fully_dynamic_cute_tensor(data: torch.Tensor):
+    return from_dlpack(data, assumed_align=16).mark_layout_dynamic()
+
+
+def _cuda_device_cache_key() -> int:
+    return torch.cuda.current_device() if torch.cuda.is_available() else -1
+
 
 @cute.kernel
 def kimik25_rmsnorm_kernel(
-    data: cute.Tensor, # (Sp, (lora_dim // k, k))
-    weights: cute.Tensor, # (lora_dim // k, k)
+    data: cute.Tensor,  # (Sp, (lora_dim // k, k))
+    weights: cute.Tensor,  # (lora_dim // k, k)
     lora_dim: cutlass.Constexpr,
     eps: cutlass.Constexpr,
     k: cutlass.Constexpr,
@@ -558,14 +574,15 @@ def kimik25_rmsnorm_kernel(
     assert lora_dim % k == 0
     assert lora_dim // k // 32 in [1, 2, 4, 8, 16, 32]
     allocator = cutlass.utils.SmemAllocator()
-    sdata = allocator.allocate_tensor(cutlass.Float32,
-                                     layout=cute.make_layout((lora_dim // k // 32,)),
-                                     byte_alignment=16,
-                                     swizzle=None)
+    sdata = allocator.allocate_tensor(
+        cutlass.Float32,
+        layout=cute.make_layout((lora_dim // k // 32,)),
+        byte_alignment=16,
+        swizzle=None,
+    )
 
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
-
 
     sum: cutlass.Float32 = 0.0
     for i in cutlass.range_constexpr(k):
@@ -576,7 +593,7 @@ def kimik25_rmsnorm_kernel(
         sdata[tid // 32] = sum
     cute.arch.sync_threads()
     if tid < 32:
-        if tid < lora_dim // k // 32:
+        if tid < lora_dim // k // 32:  # noqa: SIM108
             sum = sdata[tid]
         else:
             sum = 0.0
@@ -590,6 +607,7 @@ def kimik25_rmsnorm_kernel(
         x = (x * invnorm).to(cutlass.BFloat16) * weights[tid, i]
         data[bid, (tid, i)] = x
 
+
 @cute.jit
 def kimik25_rmsnorm(
     data: cute.Tensor,
@@ -597,19 +615,24 @@ def kimik25_rmsnorm(
     lora_dim: cutlass.Constexpr,
     eps: cutlass.Constexpr,
     k: cutlass.Constexpr,
-    stream: CUstream
+    stream: CUstream,
 ):
     data = cute.make_tensor(
         data.iterator,
-        cute.make_layout((data.shape[0], (lora_dim // k, k)), stride=(data.stride[0], (1, lora_dim // k)))
+        cute.make_layout(
+            (data.shape[0], (lora_dim // k, k)),
+            stride=(data.stride[0], (1, lora_dim // k)),
+        ),
     )
     weights = cute.make_tensor(
         weights.iterator,
-        cute.make_layout((lora_dim // k, k), stride=(1, lora_dim // k))
+        cute.make_layout((lora_dim // k, k), stride=(1, lora_dim // k)),
     )
     grid = (data.shape[0], 1, 1)
     block = (lora_dim // k, 1, 1)
-    kimik25_rmsnorm_kernel(data, weights, lora_dim, eps, k).launch(grid=grid, block=block, stream=stream)
+    kimik25_rmsnorm_kernel(data, weights, lora_dim, eps, k).launch(
+        grid=grid, block=block, stream=stream
+    )
 
 
 @cute.kernel
@@ -686,6 +709,7 @@ def kimik25_rmsnorm_special_qkv_fused_kernel(
         invnorm = sdata[0]
         data[bid - Sp, (None, tid, 3)] = (x3 * invnorm).to(cutlass.BFloat16) * w3
 
+
 @cute.jit
 def kimik25_rmsnorm_special_qkv_fused(
     data: cute.Tensor,
@@ -705,8 +729,12 @@ def kimik25_rmsnorm_special_qkv_fused(
             stride=(row_stride, (1, 2, lora_dim_kv)),
         ),
     )
-    weights_q = cute.make_tensor(weights_q.iterator, cute.make_layout((2, lora_dim_q // 2)))
-    weights_kv = cute.make_tensor(weights_kv.iterator, cute.make_layout((2, lora_dim_kv // 2)))
+    weights_q = cute.make_tensor(
+        weights_q.iterator, cute.make_layout((2, lora_dim_q // 2))
+    )
+    weights_kv = cute.make_tensor(
+        weights_kv.iterator, cute.make_layout((2, lora_dim_kv // 2))
+    )
     grid = (data.shape[0] * 2, 1, 1)
     block = (lora_dim_kv // 2, 1, 1)
     kimik25_rmsnorm_special_qkv_fused_kernel(
@@ -737,19 +765,24 @@ def kimik25_rope_kernel(
     cos, sin = cos_sin_cache[pos, tidx], cos_sin_cache[pos, tidx + 32]
     if bidy > 0:
         for i in cutlass.range_constexpr(K):
-            cute.autovec_copy(query[bidx, (i, bidy - 1), (None, tidx)], scratch[None, i])
-        
+            cute.autovec_copy(
+                query[bidx, (i, bidy - 1), (None, tidx)], scratch[None, i]
+            )
+
         for i in cutlass.range_constexpr(K):
             a, b = scratch[0, i], scratch[1, i]
             scratch[0, i] = a * cos - b * sin
             scratch[1, i] = a * sin + b * cos
-            cute.autovec_copy(scratch[None, i], query[bidx, (i, bidy - 1), (None, tidx)])
+            cute.autovec_copy(
+                scratch[None, i], query[bidx, (i, bidy - 1), (None, tidx)]
+            )
     else:
         cute.autovec_copy(key[bidx, 0, (None, tidx)], scratch[None, 0])
         a, b = scratch[0], scratch[1]
         scratch[0] = a * cos - b * sin
         scratch[1] = a * sin + b * cos
         cute.autovec_copy(scratch[None, 0], key[bidx, 0, (None, tidx)])
+
 
 @cute.jit
 def kimik25_rope(
@@ -768,7 +801,11 @@ def kimik25_rope(
         query.iterator,
         cute.make_layout(
             (sp, (K, N_local // K), (2, half_rope_dim)),
-            stride=(cute.assume(query.stride[0], divby=2), (cute.assume(query.stride[1], divby=2), query.stride[1] * K), (1, 2)),
+            stride=(
+                cute.assume(query.stride[0], divby=2),
+                (cute.assume(query.stride[1], divby=2), query.stride[1] * K),
+                (1, 2),
+            ),
         ),
     )
     key = cute.logical_divide(key, (1, 1, 2))[(0, None), (0, None), None]
@@ -777,6 +814,106 @@ def kimik25_rope(
         block=(half_rope_dim, 1, 1),
         stream=stream,
     )
+
+
+kimik25_rmsnorm_special_qkv_split = kimik25_rmsnorm_special_qkv_fused
+
+
+def _run_kimik25_rmsnorm_special_qkv_fused(
+    *,
+    data: torch.Tensor,
+    weights_q: torch.Tensor,
+    weights_kv: torch.Tensor,
+    lora_dim_q: int,
+    lora_dim_kv: int,
+    eps_q: float,
+    eps_kv: float,
+) -> None:
+    cache_key = (
+        "kimik25_rmsnorm_special_qkv_fused",
+        _cuda_device_cache_key(),
+        data.dtype,
+        data.ndim,
+        tuple(data.shape[1:]),
+        tuple(data.stride()[1:]),
+        weights_q.dtype,
+        tuple(weights_q.shape),
+        tuple(weights_q.stride()),
+        weights_kv.dtype,
+        tuple(weights_kv.shape),
+        tuple(weights_kv.stride()),
+        lora_dim_q,
+        lora_dim_kv,
+        float(eps_q),
+        float(eps_kv),
+    )
+    executor = _get_cutedsl_executor(
+        cache_key,
+        kimik25_rmsnorm_special_qkv_fused,
+        data=_make_dynamic_cute_tensor(data),
+        weights_q=from_dlpack(weights_q, assumed_align=16),
+        weights_kv=from_dlpack(weights_kv, assumed_align=16),
+        lora_dim_q=lora_dim_q,
+        lora_dim_kv=lora_dim_kv,
+        eps_q=eps_q,
+        eps_kv=eps_kv,
+        stream=cutlass_torch.current_stream(),
+    )
+    executor(
+        data=_make_dynamic_cute_tensor(data),
+        weights_q=from_dlpack(weights_q, assumed_align=16),
+        weights_kv=from_dlpack(weights_kv, assumed_align=16),
+        stream=cutlass_torch.current_stream(),
+    )
+
+
+def _run_kimik25_rope(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    num_local_heads: int,
+    half_rope_dim: int,
+) -> None:
+    cache_key = (
+        "kimik25_rope",
+        _cuda_device_cache_key(),
+        positions.dtype,
+        positions.ndim,
+        tuple(positions.stride()),
+        query.dtype,
+        query.ndim,
+        tuple(query.shape[1:]),
+        tuple(query.stride()[2:]),
+        key.dtype,
+        key.ndim,
+        tuple(key.shape[1:]),
+        tuple(key.stride()[2:]),
+        cos_sin_cache.dtype,
+        tuple(cos_sin_cache.shape),
+        tuple(cos_sin_cache.stride()),
+        num_local_heads,
+        half_rope_dim,
+    )
+    executor = _get_cutedsl_executor(
+        cache_key,
+        kimik25_rope,
+        positions=_make_fully_dynamic_cute_tensor(positions),
+        query=_make_fully_dynamic_cute_tensor(query),
+        key=_make_fully_dynamic_cute_tensor(key),
+        cos_sin_cache=from_dlpack(cos_sin_cache, assumed_align=16),
+        N_local=num_local_heads,
+        half_rope_dim=half_rope_dim,
+        stream=cutlass_torch.current_stream(),
+    )
+    executor(
+        positions=_make_fully_dynamic_cute_tensor(positions),
+        query=_make_fully_dynamic_cute_tensor(query),
+        key=_make_fully_dynamic_cute_tensor(key),
+        cos_sin_cache=from_dlpack(cos_sin_cache, assumed_align=16),
+        stream=cutlass_torch.current_stream(),
+    )
+
 
 class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
     """Forked MLA path for kernel benchmarking experiments."""
@@ -938,6 +1075,7 @@ class KimiK25Nvfp4DecoderLayer(nn.Module):
         shared_experts.forward = _fused_forward  # type: ignore[method-assign]
 
 
+@support_torch_compile
 class KimiK25Nvfp4TextModel(nn.Module):
     """Text-only model body for Kimi-K2.5 NVFP4."""
 

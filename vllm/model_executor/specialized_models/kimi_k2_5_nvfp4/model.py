@@ -344,6 +344,9 @@ def _forked_kimi_mla_attn(
     )
 
     fwd_ctx = get_forward_context()
+    if fwd_ctx.attn_metadata is None:
+        output.zero_()
+        return output
     attn_metadata = fwd_ctx.attn_metadata.get(mla.layer_name)
 
     num_actual_toks = attn_metadata.num_actual_tokens

@@ -378,17 +378,7 @@ def _forked_kimi_mla_attn(
     q, _ = layer.q_b_proj(q_c)
 
     q = q.view(-1, layer.num_local_heads, layer.qk_head_dim)
-    q_pe = q[..., layer.qk_nope_head_dim :]
     k_pe = k_pe.unsqueeze(1)
-
-    assert q_pe.dtype == layer.rotary_emb.cos_sin_cache.dtype
-    _run_kimik25_rope(
-        positions,
-        q_pe,
-        layer.rotary_emb.cos_sin_cache,
-        layer.num_local_heads,
-        layer.qk_rope_head_dim // 2,
-    )
 
     main_stream.wait_stream(cache_stream)
 
@@ -415,6 +405,15 @@ def _forked_kimi_mla_attn(
     num_mha_tokens = q.size(0) - num_mqa_tokens
 
     if num_mha_tokens > 0:
+        q_pe = q[..., layer.qk_nope_head_dim :]
+        assert q_pe.dtype == layer.rotary_emb.cos_sin_cache.dtype
+        _run_kimik25_rope(
+            positions[num_mqa_tokens:num_actual_toks],
+            q_pe[num_mqa_tokens:],
+            layer.rotary_emb.cos_sin_cache,
+            layer.num_local_heads,
+            layer.qk_rope_head_dim // 2,
+        )
         mla.impl.forward_mha(
             q[num_mqa_tokens:],
             kv_c[num_mqa_tokens:],
@@ -441,8 +440,12 @@ def _forked_kimi_mla_attn(
         torch.bmm(mqa_q_nope, mla.W_UK_T, out=mqa_ql_nope)
         mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-        mqa_q_final = mla._decode_concat_quant_fp8_op(
-            mqa_ql_nope, mqa_q_pe, mla._q_scale
+        mqa_q_final = _run_kimik25_decode_rope_concat_quant_fp8(
+            positions=positions[:num_mqa_tokens],
+            ql_nope=mqa_ql_nope,
+            q_pe=mqa_q_pe,
+            cos_sin_cache=layer.rotary_emb.cos_sin_cache,
+            scale=mla._q_scale,
         )
 
         decode_attn_out, _ = mla.impl.forward_mqa(
@@ -1045,6 +1048,103 @@ def kimik25_rope(
 
 
 @cute.kernel
+def kimik25_decode_rope_concat_quant_fp8_kernel(
+    positions: cute.Tensor,  # (B,)
+    ql_nope: cute.Tensor,  # (B, N, q_lora_dim)
+    q_pe: cute.Tensor,  # (B, N, (2, pe_dim // 2))
+    q_out: cute.Tensor,  # uint8 bytes, (B, N, q_lora_dim + pe_dim)
+    cos_sin_cache: cute.Tensor,  # (max_position_embeddings, pe_dim)
+    scale: cute.Tensor,  # (1,)
+    q_lora_dim: cutlass.Constexpr,
+    pe_dim: cutlass.Constexpr,
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    token_idx, head_idx, _ = cute.arch.block_idx()
+    scale_value = scale[0]
+
+    for tile_idx in cutlass.range_constexpr(q_lora_dim // 256):
+        q_idx = tile_idx * 256 + tidx
+        q_val = ql_nope[token_idx, head_idx, q_idx].to(cutlass.Float32)
+        q_out[token_idx, head_idx, q_idx] = cutlass.Uint8(
+            _cvt_f32_to_e4m3(q_val / scale_value) & cutlass.Uint32(0xFF)
+        )
+
+    half_pe_dim: cutlass.Constexpr = pe_dim // 2
+    if tidx < half_pe_dim:
+        pos = positions[token_idx]
+        cos = cos_sin_cache[pos, tidx]
+        sin = cos_sin_cache[pos, tidx + half_pe_dim]
+        in_scratch = cute.make_rmem_tensor(2, dtype=cutlass.BFloat16)
+        cute.autovec_copy(q_pe[token_idx, head_idx, (None, tidx)], in_scratch)
+        a = in_scratch[0]
+        b = in_scratch[1]
+        qx = (a * cos - b * sin).to(cutlass.BFloat16)
+        qy = (a * sin + b * cos).to(cutlass.BFloat16)
+        q_out[token_idx, head_idx, q_lora_dim + tidx * 2] = cutlass.Uint8(
+            _cvt_f32_to_e4m3(qx.to(cutlass.Float32) / scale_value)
+            & cutlass.Uint32(0xFF)
+        )
+        q_out[token_idx, head_idx, q_lora_dim + tidx * 2 + 1] = cutlass.Uint8(
+            _cvt_f32_to_e4m3(qy.to(cutlass.Float32) / scale_value)
+            & cutlass.Uint32(0xFF)
+        )
+
+
+@cute.jit
+def kimik25_decode_rope_concat_quant_fp8(
+    positions: cute.Tensor,
+    ql_nope: cute.Tensor,
+    q_pe: cute.Tensor,
+    q_out: cute.Tensor,
+    cos_sin_cache: cute.Tensor,
+    scale: cute.Tensor,
+    q_lora_dim: cutlass.Constexpr,
+    pe_dim: cutlass.Constexpr,
+    stream: CUstream,
+):
+    sp = positions.shape[0]
+    ql_nope = cute.make_tensor(
+        ql_nope.iterator,
+        cute.make_layout(
+            (sp, ql_nope.shape[1], q_lora_dim),
+            stride=(ql_nope.stride[0], ql_nope.stride[1], 1),
+        ),
+    )
+    q_pe = cute.make_tensor(
+        q_pe.iterator,
+        cute.make_layout(
+            (sp, q_pe.shape[1], (2, pe_dim // 2)),
+            stride=(
+                cute.assume(q_pe.stride[0], divby=2),
+                cute.assume(q_pe.stride[1], divby=2),
+                (1, 2),
+            ),
+        ),
+    )
+    q_out = cute.make_tensor(
+        q_out.iterator,
+        cute.make_layout(
+            (sp, q_out.shape[1], q_lora_dim + pe_dim),
+            stride=(q_out.stride[0], q_out.stride[1], 1),
+        ),
+    )
+    kimik25_decode_rope_concat_quant_fp8_kernel(
+        positions,
+        ql_nope,
+        q_pe,
+        q_out,
+        cos_sin_cache,
+        scale,
+        q_lora_dim,
+        pe_dim,
+    ).launch(
+        grid=(sp, ql_nope.shape[1], 1),
+        block=(256, 1, 1),
+        stream=stream,
+    )
+
+
+@cute.kernel
 def kimik25_rmsnorm_special_qkv_split_kernel(
     data: cute.Tensor,  # (Sp, (2, lora_dim_kv // 2, 4))
     weights_q: cute.Tensor,  # (2, lora_dim_q // 2)
@@ -1312,6 +1412,70 @@ def _run_kimik25_rope(
         cos_sin_cache=cos_sin_cache_cute,
         stream=cutlass_torch.current_stream(),
     )
+
+
+def _run_kimik25_decode_rope_concat_quant_fp8(
+    *,
+    positions: torch.Tensor,
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    q_lora_dim = ql_nope.shape[2]
+    pe_dim = q_pe.shape[2]
+    assert q_lora_dim == 512, "Kimi-K2.5 NVFP4 expects kv_lora_rank=512"
+    assert pe_dim == 64, "Kimi-K2.5 NVFP4 expects qk_rope_head_dim=64"
+    assert ql_nope.shape[:2] == q_pe.shape[:2]
+
+    scale = scale.view(1)
+    q_out = torch.empty(
+        (ql_nope.shape[0], ql_nope.shape[1], q_lora_dim + pe_dim),
+        device=ql_nope.device,
+        dtype=torch.uint8,
+    )
+
+    positions_cute = _make_fully_dynamic_cute_tensor(positions)
+    ql_nope_cute = _make_dynamic_cute_tensor(ql_nope)
+    q_pe_cute = _make_fully_dynamic_cute_tensor(q_pe)
+    q_out_cute = _make_dynamic_cute_tensor(q_out)
+    cos_sin_cache_cute = from_dlpack(cos_sin_cache, assumed_align=16)
+    scale_cute = from_dlpack(scale, assumed_align=4)
+    cache_key = (
+        "kimik25_decode_rope_concat_quant_fp8",
+        _cuda_device_cache_key(),
+        _cutedsl_arg_cache_key(positions_cute),
+        _cutedsl_arg_cache_key(ql_nope_cute),
+        _cutedsl_arg_cache_key(q_pe_cute),
+        _cutedsl_arg_cache_key(q_out_cute),
+        _cutedsl_arg_cache_key(cos_sin_cache_cute),
+        _cutedsl_arg_cache_key(scale_cute),
+        q_lora_dim,
+        pe_dim,
+    )
+    executor = _get_cutedsl_executor(
+        cache_key,
+        kimik25_decode_rope_concat_quant_fp8,
+        positions=positions_cute,
+        ql_nope=ql_nope_cute,
+        q_pe=q_pe_cute,
+        q_out=q_out_cute,
+        cos_sin_cache=cos_sin_cache_cute,
+        scale=scale_cute,
+        q_lora_dim=q_lora_dim,
+        pe_dim=pe_dim,
+        stream=cutlass_torch.current_stream(),
+    )
+    executor(
+        positions=positions_cute,
+        ql_nope=ql_nope_cute,
+        q_pe=q_pe_cute,
+        q_out=q_out_cute,
+        cos_sin_cache=cos_sin_cache_cute,
+        scale=scale_cute,
+        stream=cutlass_torch.current_stream(),
+    )
+    return q_out.view(current_platform.fp8_dtype())
 
 
 class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):

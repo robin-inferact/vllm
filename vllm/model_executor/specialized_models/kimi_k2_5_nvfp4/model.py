@@ -9,29 +9,60 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 import torch
+import torch.nn.functional as F
 from cuda.bindings.driver import CUstream
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 from torch import nn
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_dp_group,
+    get_pcp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
+    FusedMoEParallelConfig,
+    RoutingMethodType,
+)
+from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+    TrtLlmNvFp4ExpertsMonolithic,
+)
+from vllm.model_executor.layers.fused_moe.layer import (
+    FusedMoE,
+    determine_expert_map,
+    determine_expert_placement_strategy,
+    get_compressed_expert_map,
+)
+from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
+from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
-from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4LinearMethod
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptNvFp4Config,
+    ModelOptNvFp4FusedMoE,
+    ModelOptNvFp4LinearMethod,
+)
+from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    activation_to_flashinfer_int,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2ForCausalLM,
     DeepSeekV2FusedQkvAProjLinear,
     DeepseekV2MLP,
-    DeepseekV2MoE,
     yarn_get_mscale,
 )
 from vllm.model_executor.models.interfaces import (
@@ -47,12 +78,18 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils.flashinfer import flashinfer_scaled_fp4_mm
+from vllm.utils.flashinfer import (
+    flashinfer_scaled_fp4_mm,
+    has_flashinfer_trtllm_fused_moe,
+)
 from vllm.utils.torch_utils import (
+    aux_stream,
+    current_stream,
     direct_register_custom_op,
     is_quantized_kv_cache,
 )
 from vllm.v1.attention.selector import get_attn_backend
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 _TARGET_MODEL_NAMES = {"nvidia/Kimi-K2.5-NVFP4"}
 logger = init_logger(__name__)
@@ -88,6 +125,12 @@ def _get_kimi_nvfp4_specialization_rejection_reason(
     if not _is_kimi_nvfp4_checkpoint(vllm_config):
         return "the checkpoint is not nvidia/Kimi-K2.5-NVFP4"
 
+    quant_config = vllm_config.quant_config
+    if not isinstance(quant_config, ModelOptNvFp4Config):
+        return "the specialized Kimi-K2.5 MoE path requires ModelOpt NVFP4"
+    if not quant_config.is_checkpoint_nvfp4_serialized:
+        return "the specialized Kimi-K2.5 MoE path requires serialized NVFP4"
+
     cache_config = vllm_config.cache_config
     kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
     if not kv_cache_dtype.startswith("fp8"):
@@ -98,6 +141,60 @@ def _get_kimi_nvfp4_specialization_rejection_reason(
 
     config = vllm_config.model_config.hf_config
     text_config = getattr(config, "text_config", config)
+    parallel_config = vllm_config.parallel_config
+
+    if parallel_config.enable_eplb:
+        return "the specialized Kimi-K2.5 MoE path does not support EPLB"
+    if parallel_config.use_sequence_parallel_moe:
+        return "the specialized Kimi-K2.5 MoE path does not support MoE SP"
+    if parallel_config.data_parallel_size != 1:
+        return "the specialized Kimi-K2.5 MoE path does not support DP"
+    if (
+        parallel_config.enable_expert_parallel
+        and parallel_config.tensor_parallel_size > 1
+        and parallel_config.expert_placement_strategy != "linear"
+    ):
+        return (
+            "the specialized Kimi-K2.5 MoE path supports EP only with "
+            "linear expert placement"
+        )
+
+    moe_backend = getattr(vllm_config.kernel_config, "moe_backend", "auto")
+    if moe_backend not in ("auto", "flashinfer_trtllm"):
+        return (
+            "the specialized Kimi-K2.5 MoE path requires the auto or "
+            f"flashinfer_trtllm MoE backend, but got {moe_backend!r}"
+        )
+    if (
+        not current_platform.is_cuda()
+        or not current_platform.is_device_capability_family(100)
+    ):
+        return "the specialized Kimi-K2.5 MoE path requires Blackwell CUDA"
+    if not has_flashinfer_trtllm_fused_moe():
+        return "FlashInfer TRTLLM fused NVFP4 MoE is unavailable"
+    if envs.is_set("VLLM_USE_FLASHINFER_MOE_FP4") and not (
+        envs.VLLM_USE_FLASHINFER_MOE_FP4
+    ):
+        return "VLLM_USE_FLASHINFER_MOE_FP4 disables FlashInfer NVFP4 MoE"
+    if (
+        envs.is_set("VLLM_FLASHINFER_MOE_BACKEND")
+        and envs.VLLM_FLASHINFER_MOE_BACKEND != "latency"
+    ):
+        return "the specialized Kimi-K2.5 MoE path requires FlashInfer latency MoE"
+
+    if getattr(text_config, "hidden_act", None) != "silu":
+        return "the specialized Kimi-K2.5 MoE path only supports silu experts"
+    if getattr(text_config, "hidden_size", None) != 7168:
+        return "the specialized Kimi-K2.5 MoE path expects hidden_size=7168"
+    if getattr(text_config, "n_routed_experts", None) != 384:
+        return "the specialized Kimi-K2.5 MoE path expects 384 routed experts"
+    if getattr(text_config, "topk_method", None) != "noaux_tc":
+        return "the specialized Kimi-K2.5 MoE path requires noaux_tc routing"
+    if getattr(text_config, "scoring_func", "softmax") != "sigmoid":
+        return "the specialized Kimi-K2.5 MoE path requires sigmoid routing"
+    if getattr(text_config, "n_group", 1) <= 0:
+        return "the specialized Kimi-K2.5 MoE path requires grouped routing"
+
     num_local_heads = (
         text_config.num_attention_heads // get_tensor_model_parallel_world_size()
     )
@@ -1884,6 +1981,548 @@ class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
         return self.o_proj(attn_out)[0]
 
 
+class _KimiK25SharedExpertOverlap:
+    """Kimi-only shared expert overlap with the routed MoE path."""
+
+    def __init__(
+        self,
+        layer: nn.Module,
+        *,
+        enable_dbo: bool,
+    ) -> None:
+        self.layer = layer
+        self.enable_dbo = enable_dbo
+        self.outputs: list[torch.Tensor | None] = [None, None]
+        self.stream = (
+            None
+            if envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM
+            else aux_stream()
+        )
+
+    @property
+    def output_idx(self) -> int:
+        return dbo_current_ubatch_id() if self.enable_dbo else 0
+
+    def should_overlap(self, hidden_states: torch.Tensor) -> bool:
+        return (
+            current_platform.is_cuda()
+            and self.stream is not None
+            and hidden_states.shape[0]
+            <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+        )
+
+    def start(self, hidden_states: torch.Tensor) -> bool:
+        if not self.should_overlap(hidden_states):
+            return False
+
+        assert self.stream is not None
+        idx = self.output_idx
+        assert self.outputs[idx] is None
+        hidden_states.record_stream(self.stream)
+        self.stream.wait_stream(current_stream())
+        with torch.cuda.stream(self.stream):
+            self.outputs[idx] = self.layer(hidden_states)
+        return True
+
+    def finish(self, hidden_states: torch.Tensor, overlapped: bool) -> torch.Tensor:
+        if not overlapped:
+            return self.layer(hidden_states)
+
+        assert self.stream is not None
+        current_stream().wait_stream(self.stream)
+        idx = self.output_idx
+        output = self.outputs[idx]
+        assert output is not None
+        self.outputs[idx] = None
+        return output
+
+
+def _kimi_k25_nvfp4_trtllm_moe(
+    routing_logits: torch.Tensor,
+    routing_bias: torch.Tensor | None,
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    output1_scale_scalar: torch.Tensor,
+    output1_scale_gate_scalar: torch.Tensor,
+    output2_scale_scalar: torch.Tensor,
+    output_template: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: int,
+    topk_group: int,
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routing_method_type: int,
+    activation_type: int,
+) -> torch.Tensor:
+    import flashinfer
+
+    output = torch.empty_like(output_template)
+    result = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
+        gemm2_bias=None,
+        output1_scale_scalar=output1_scale_scalar,
+        output1_scale_gate_scalar=output1_scale_gate_scalar,
+        output2_scale_scalar=output2_scale_scalar,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=n_group,
+        topk_group=topk_group,
+        intermediate_size=intermediate_size,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        routed_scaling_factor=1.0,
+        routing_method_type=routing_method_type,
+        do_finalize=True,
+        activation_type=activation_type,
+        output=output,
+    )[0]
+    if result.data_ptr() != output.data_ptr():
+        output.copy_(result)
+    return output
+
+
+def _kimi_k25_nvfp4_trtllm_moe_fake(
+    routing_logits: torch.Tensor,
+    routing_bias: torch.Tensor | None,
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    output1_scale_scalar: torch.Tensor,
+    output1_scale_gate_scalar: torch.Tensor,
+    output2_scale_scalar: torch.Tensor,
+    output_template: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: int,
+    topk_group: int,
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routing_method_type: int,
+    activation_type: int,
+) -> torch.Tensor:
+    del (
+        routing_logits,
+        routing_bias,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        output1_scale_scalar,
+        output1_scale_gate_scalar,
+        output2_scale_scalar,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routing_method_type,
+        activation_type,
+    )
+    return torch.empty_like(output_template)
+
+
+direct_register_custom_op(
+    op_name="kimi_k25_nvfp4_trtllm_moe",
+    op_func=_kimi_k25_nvfp4_trtllm_moe,
+    fake_impl=_kimi_k25_nvfp4_trtllm_moe_fake,
+)
+
+
+class KimiK25Nvfp4RoutedExperts(nn.Module):
+    """Kimi-K2.5 routed experts for the FlashInfer TRTLLM NVFP4 path."""
+
+    weight_loader = FusedMoE.weight_loader
+    _load_per_tensor_weight_scale = FusedMoE._load_per_tensor_weight_scale
+    _load_combined_w13_weight_scale = FusedMoE._load_combined_w13_weight_scale
+    _load_model_weight_or_group_weight_scale = (
+        FusedMoE._load_model_weight_or_group_weight_scale
+    )
+    _load_per_channel_weight_scale = FusedMoE._load_per_channel_weight_scale
+    _get_hidden_dim = staticmethod(FusedMoE._get_hidden_dim)
+    _narrow_expert_data_for_padding = staticmethod(
+        FusedMoE._narrow_expert_data_for_padding
+    )
+    _load_w13 = FusedMoE._load_w13
+    _load_w2 = FusedMoE._load_w2
+    _load_single_value = FusedMoE._load_single_value
+    _load_g_idx = FusedMoE._load_g_idx
+
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        config,
+        quant_config: ModelOptNvFp4Config,
+        prefix: str,
+        e_score_correction_bias: torch.Tensor | None,
+    ) -> None:
+        super().__init__()
+        if not quant_config.is_checkpoint_nvfp4_serialized:
+            raise ValueError("Kimi-K2.5 NVFP4 MoE requires serialized NVFP4 weights.")
+
+        self.layer_name = prefix
+        self.moe_parallel_config = FusedMoEParallelConfig.make(
+            tp_size_=get_tensor_model_parallel_world_size(),
+            pcp_size_=get_pcp_group().world_size,
+            dp_size_=get_dp_group().world_size,
+            sp_size_=1,
+            vllm_parallel_config=vllm_config.parallel_config,
+        )
+        self.tp_size = self.moe_parallel_config.tp_size
+        self.tp_rank = self.moe_parallel_config.tp_rank
+        self.ep_size = self.moe_parallel_config.ep_size
+        self.ep_rank = self.moe_parallel_config.ep_rank
+        self.global_num_experts = config.n_routed_experts
+        self.logical_num_experts = config.n_routed_experts
+        self.expert_placement_strategy = (
+            vllm_config.parallel_config.expert_placement_strategy
+        )
+        self.top_k = config.num_experts_per_tok
+        self.num_expert_group = getattr(config, "n_group", 1)
+        self.topk_group = getattr(config, "topk_group", 1)
+        self.e_score_correction_bias = e_score_correction_bias
+        self.apply_router_weight_on_input = False
+        self.shared_experts = None
+        self.activation = MoEActivation.from_str(config.hidden_act)
+        if self.activation != MoEActivation.SILU:
+            raise ValueError("Kimi-K2.5 NVFP4 MoE only supports SiLU experts.")
+        self.routing_method_type = int(RoutingMethodType.DeepSeekV3)
+        self.activation_type = activation_to_flashinfer_int(self.activation)
+
+        if self.moe_parallel_config.enable_eplb:
+            raise ValueError("Kimi-K2.5 NVFP4 specialized MoE does not support EPLB.")
+        if self.moe_parallel_config.use_all2all_kernels:
+            raise ValueError(
+                "Kimi-K2.5 NVFP4 specialized MoE does not support DP/EP all2all."
+            )
+        self.expert_placement_strategy = determine_expert_placement_strategy(
+            expert_placement_strategy=self.expert_placement_strategy,
+            moe_parallel_config=self.moe_parallel_config,
+            num_expert_group=self.num_expert_group,
+            num_redundant_experts=0,
+            enable_eplb=False,
+        )
+        if (
+            self.moe_parallel_config.use_ep
+            and self.expert_placement_strategy != "linear"
+        ):
+            raise ValueError(
+                "Kimi-K2.5 NVFP4 specialized MoE supports EP only with "
+                "linear expert placement."
+            )
+
+        if self.moe_parallel_config.use_ep:
+            self.local_num_experts, expert_map, expert_mask = determine_expert_map(
+                ep_size=self.ep_size,
+                ep_rank=self.ep_rank,
+                global_num_experts=self.global_num_experts,
+                expert_placement_strategy=self.expert_placement_strategy,
+            )
+            assert expert_map is not None
+            self.register_buffer("_expert_map", expert_map)
+            self.register_buffer("expert_mask", expert_mask)
+            local_experts = (expert_map >= 0).nonzero().flatten()
+            if local_experts.numel() == 0:
+                self.local_expert_offset = 0
+            else:
+                self.local_expert_offset = int(local_experts[0].item())
+            logger.info_once(
+                "[EP Rank %s/%s] Kimi-K2.5 NVFP4 routed experts use %s "
+                "placement. Local/global experts: %s/%s. Local map: %s.",
+                self.ep_rank,
+                self.ep_size,
+                self.expert_placement_strategy,
+                self.local_num_experts,
+                self.global_num_experts,
+                get_compressed_expert_map(self._expert_map),
+            )
+        else:
+            self.local_num_experts = self.global_num_experts
+            self._expert_map = None
+            self.expert_mask = None
+            self.local_expert_offset = 0
+
+        if config.moe_intermediate_size % self.tp_size != 0:
+            raise ValueError(
+                "Kimi-K2.5 NVFP4 MoE requires moe_intermediate_size to be "
+                f"divisible by TP size, got {config.moe_intermediate_size} "
+                f"and TP={self.tp_size}."
+            )
+        intermediate_size_per_partition = config.moe_intermediate_size // self.tp_size
+
+        self.moe_config = FusedMoEConfig(
+            num_experts=self.global_num_experts,
+            experts_per_token=self.top_k,
+            hidden_dim=config.hidden_size,
+            hidden_dim_unpadded=config.hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            intermediate_size_per_partition_unpadded=intermediate_size_per_partition,
+            num_local_experts=self.local_num_experts,
+            num_logical_experts=self.logical_num_experts,
+            moe_parallel_config=self.moe_parallel_config,
+            in_dtype=vllm_config.model_config.dtype,
+            moe_backend=vllm_config.kernel_config.moe_backend,
+            router_logits_dtype=torch.float32,
+            max_num_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
+            has_bias=False,
+            is_act_and_mul=True,
+            is_lora_enabled=vllm_config.lora_config is not None,
+            activation=self.activation,
+            device=vllm_config.device_config.device,
+            routing_method=RoutingMethodType.DeepSeekV3,
+            disable_inplace=True,
+        )
+
+        self.quant_method = ModelOptNvFp4FusedMoE(quant_config, self.moe_config)
+        if (
+            self.quant_method.nvfp4_backend != NvFp4MoeBackend.FLASHINFER_TRTLLM
+            or self.quant_method.experts_cls is not TrtLlmNvFp4ExpertsMonolithic
+        ):
+            raise ValueError(
+                "Kimi-K2.5 NVFP4 specialized MoE requires the FlashInfer "
+                "TRTLLM monolithic NVFP4 backend."
+            )
+
+        self.quant_method.create_weights(
+            layer=self,
+            num_experts=self.local_num_experts,
+            hidden_size=config.hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=torch.get_default_dtype(),
+            weight_loader=self.weight_loader,
+            global_num_experts=self.global_num_experts,
+        )
+
+    def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
+        if self._expert_map is None:
+            return expert_id
+        return self._expert_map[expert_id].item()
+
+    def _maybe_init_expert_routing_tables(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        return None
+
+    @property
+    def expert_map(self) -> torch.Tensor | None:
+        return self._expert_map
+
+    def update_expert_map(self) -> None:
+        if not self.moe_parallel_config.use_ep:
+            return None
+        self.local_num_experts, expert_map, expert_mask = determine_expert_map(
+            ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            global_num_experts=self.global_num_experts,
+            expert_placement_strategy=self.expert_placement_strategy,
+        )
+        assert expert_map is not None
+        self.register_buffer("_expert_map", expert_map)
+        self.register_buffer("expert_mask", expert_mask)
+        local_experts = (expert_map >= 0).nonzero().flatten()
+        self.local_expert_offset = (
+            int(local_experts[0].item()) if local_experts.numel() > 0 else 0
+        )
+        self.moe_config.num_local_experts = self.local_num_experts
+        return None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        quant_config = self.quant_method.moe_quant_config
+        if quant_config is None:
+            raise RuntimeError("Kimi-K2.5 NVFP4 MoE weights were not post-processed.")
+
+        original_hidden_dim = hidden_states.shape[-1]
+        output_template = hidden_states
+        if self.moe_config.hidden_dim != original_hidden_dim:
+            hidden_states = F.pad(
+                hidden_states,
+                (0, self.moe_config.hidden_dim - original_hidden_dim),
+                mode="constant",
+                value=0.0,
+            )
+
+        assert quant_config.a1_gscale is not None
+        hidden_states, hidden_states_scale = ops.scaled_fp4_quant(
+            hidden_states,
+            quant_config.a1_gscale,
+            is_sf_swizzled_layout=False,
+        )
+        assert hidden_states_scale is not None
+        assert quant_config.w1_scale is not None
+        assert quant_config.w2_scale is not None
+        assert quant_config.g1_alphas is not None
+        assert quant_config.g2_alphas is not None
+        assert hasattr(self, "g1_scale_c")
+
+        routing_bias = self.e_score_correction_bias
+        if routing_bias is not None:
+            routing_bias = routing_bias.to(torch.bfloat16)
+
+        output = torch.ops.vllm.kimi_k25_nvfp4_trtllm_moe(
+            router_logits.to(torch.float32),
+            routing_bias,
+            hidden_states,
+            hidden_states_scale.view(torch.float8_e4m3fn).reshape(
+                *hidden_states.shape[:-1], -1
+            ),
+            self.w13_weight,
+            quant_config.w1_scale.view(torch.float8_e4m3fn),
+            self.w2_weight,
+            quant_config.w2_scale.view(torch.float8_e4m3fn),
+            self.g1_scale_c,
+            quant_config.g1_alphas,
+            quant_config.g2_alphas,
+            output_template,
+            self.global_num_experts,
+            self.top_k,
+            self.num_expert_group,
+            self.topk_group,
+            self.moe_config.intermediate_size_per_partition,
+            self.local_expert_offset,
+            self.local_num_experts,
+            self.routing_method_type,
+            self.activation_type,
+        )
+        return output[..., :original_hidden_dim]
+
+
+class KimiK25Nvfp4MoE(nn.Module):
+    """Inlined Kimi-K2.5 NVFP4 MoE for the FlashInfer TRTLLM backend."""
+
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        config,
+        quant_config: ModelOptNvFp4Config,
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        self.n_routed_experts = config.n_routed_experts
+        self.n_shared_experts = config.n_shared_experts
+        self.n_redundant_experts = 0
+        self.n_logical_experts = self.n_routed_experts
+        self.n_physical_experts = self.n_logical_experts
+        self.n_local_physical_experts = self.n_physical_experts
+
+        self.gate = GateLinear(
+            config.hidden_size,
+            config.n_routed_experts,
+            out_dtype=torch.float32,
+            prefix=f"{prefix}.gate",
+        )
+        if getattr(config, "topk_method", None) == "noaux_tc":
+            self.gate.e_score_correction_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32)
+            )
+        else:
+            raise ValueError("Kimi-K2.5 NVFP4 MoE requires noaux_tc routing.")
+
+        if config.n_shared_experts is None:
+            self.shared_experts = None
+            self.shared_expert_overlap = None
+        else:
+            self.shared_experts = DeepseekV2MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size
+                * config.n_shared_experts,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+                prefix=f"{prefix}.shared_experts",
+            )
+            self.shared_expert_overlap = _KimiK25SharedExpertOverlap(
+                self.shared_experts,
+                enable_dbo=vllm_config.parallel_config.enable_dbo,
+            )
+
+        self.experts = KimiK25Nvfp4RoutedExperts(
+            vllm_config=vllm_config,
+            config=config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.experts",
+            e_score_correction_bias=self.gate.e_score_correction_bias,
+        )
+        self.ep_size = self.experts.ep_size
+        self.ep_rank = self.experts.ep_rank
+        self.n_local_physical_experts = self.experts.local_num_experts
+        self.physical_expert_start = self.experts.local_expert_offset
+        self.physical_expert_end = (
+            self.physical_expert_start + self.n_local_physical_experts
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        _, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        shared_overlapped = False
+        if (
+            not torch.compiler.is_compiling()
+            and self.shared_expert_overlap is not None
+        ):
+            shared_overlapped = self.shared_expert_overlap.start(hidden_states)
+
+        router_logits, _ = self.gate(hidden_states)
+        routed_output = self.experts(hidden_states, router_logits)
+
+        shared_output = None
+        if self.shared_expert_overlap is not None:
+            if torch.compiler.is_compiling():
+                assert self.shared_experts is not None
+                shared_output = self.shared_experts(hidden_states)
+            else:
+                shared_output = self.shared_expert_overlap.finish(
+                    hidden_states,
+                    shared_overlapped,
+                )
+
+        if self.routed_scaling_factor != 1.0:
+            if routed_output.dtype != torch.float16 or shared_output is None:
+                routed_output = routed_output * self.routed_scaling_factor
+            else:
+                shared_output = shared_output * (1.0 / self.routed_scaling_factor)
+        if shared_output is not None:
+            output = shared_output + routed_output
+        else:
+            output = routed_output
+
+        if self.tp_size > 1 or self.experts.ep_size > 1:
+            output = tensor_model_parallel_all_reduce(output)
+        return output
+
+
 class KimiK25Nvfp4DecoderLayer(nn.Module):
     """Single inlined decoder layer for Kimi-K2.5 NVFP4."""
 
@@ -1901,7 +2540,10 @@ class KimiK25Nvfp4DecoderLayer(nn.Module):
 
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
-        parallel_config = vllm_config.parallel_config
+        if not isinstance(quant_config, ModelOptNvFp4Config):
+            raise ValueError(
+                "Kimi-K2.5 NVFP4 specialized model requires ModelOpt NVFP4."
+            )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = ForkedKimiK25Nvfp4MLAAttention(
@@ -1923,9 +2565,9 @@ class KimiK25Nvfp4DecoderLayer(nn.Module):
             and layer_idx % moe_layer_freq == 0
         )
         if self.is_moe:
-            self.mlp = DeepseekV2MoE(
+            self.mlp = KimiK25Nvfp4MoE(
+                vllm_config=vllm_config,
                 config=config,
-                parallel_config=parallel_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
@@ -2086,7 +2728,7 @@ class KimiK25Nvfp4TextForCausalLM(DeepseekV2ForCausalLM):
         example_moe = None
         for layer in self.model.layers:
             if isinstance(layer, KimiK25Nvfp4DecoderLayer) and isinstance(
-                layer.mlp, DeepseekV2MoE
+                layer.mlp, KimiK25Nvfp4MoE
             ):
                 example_moe = layer.mlp
                 self.moe_mlp_layers.append(layer.mlp)

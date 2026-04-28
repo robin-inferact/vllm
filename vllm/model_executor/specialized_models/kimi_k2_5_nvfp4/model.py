@@ -49,8 +49,6 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.flashinfer import flashinfer_scaled_fp4_mm
 from vllm.utils.torch_utils import (
-    aux_stream,
-    current_stream,
     direct_register_custom_op,
     is_quantized_kv_cache,
 )
@@ -333,6 +331,7 @@ def _forked_kimi_mla_attn(
     )
 
     q_c, kv_c = qkv_c.split([layer.q_lora_rank, layer.kv_lora_rank], dim=-1)
+    kv_c_cache = kv_c
     k_pe_cache = k_pe
 
     fwd_ctx = get_forward_context()
@@ -353,34 +352,10 @@ def _forked_kimi_mla_attn(
         if slot_mapping is not None:
             slot_mapping = slot_mapping.flatten()
 
-    cache_stream = aux_stream()
-    main_stream = current_stream()
-
-    # After the fused q/kv RMSNorm, the K/V cache update is independent of the
-    # q_b projection and Q RoPE, so launch it early when an aux stream exists.
-    def run_concat_and_cache_mla() -> None:
-        assert slot_mapping is not None
-        _run_kimik25_concat_and_cache_mla(
-            kv_c=kv_c,
-            k_pe=k_pe_cache,
-            kv_cache=kv_cache,
-            slot_mapping=slot_mapping,
-            kv_cache_dtype=mla.kv_cache_dtype,
-            scale=mla._k_scale,
-        )
-
-    if not torch.cuda.is_current_stream_capturing():
-        qkv_a.record_stream(cache_stream)
-    cache_stream.wait_stream(main_stream)
-    with torch.cuda.stream(cache_stream):
-        run_concat_and_cache_mla()
-
     q, _ = layer.q_b_proj(q_c)
 
     q = q.view(-1, layer.num_local_heads, layer.qk_head_dim)
     k_pe = k_pe.unsqueeze(1)
-
-    main_stream.wait_stream(cache_stream)
 
     if mla.impl.dcp_world_size == -1:
         from vllm.distributed.parallel_state import get_dcp_group
@@ -393,6 +368,7 @@ def _forked_kimi_mla_attn(
     k_pe = k_pe[:num_actual_toks]
 
     assert mla.kv_cache_dtype.startswith("fp8"), "only FP8 KV cache is supported"
+    kv_cache_storage = kv_cache
     if mla.kv_cache_dtype != "fp8_ds_mla":
         kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
@@ -403,6 +379,55 @@ def _forked_kimi_mla_attn(
     )
     num_mqa_tokens = attn_metadata.num_decode_tokens
     num_mha_tokens = q.size(0) - num_mqa_tokens
+
+    mqa_q_final: torch.Tensor | None = None
+    if num_mqa_tokens > 0:
+        mqa_q = q[:num_mqa_tokens]
+        mqa_q_nope, mqa_q_pe = mqa_q.split(
+            [mla.qk_nope_head_dim, mla.qk_rope_head_dim], dim=-1
+        )
+
+        mqa_q_nope = mqa_q_nope.transpose(0, 1)
+        N, B, P = mqa_q_nope.shape
+        _, _, L = mla.W_UK_T.shape
+
+        assert mla.q_pad_num_heads is None, "num_heads padding is unsupported"
+        mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
+
+        torch.bmm(mqa_q_nope, mla.W_UK_T, out=mqa_ql_nope)
+        mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
+
+        if slot_mapping is not None:
+            mqa_q_final = _run_kimik25_decode_rope_concat_quant_fp8_and_cache_mla(
+                positions=positions[:num_mqa_tokens],
+                ql_nope=mqa_ql_nope,
+                q_pe=mqa_q_pe,
+                cos_sin_cache=layer.rotary_emb.cos_sin_cache,
+                q_scale=mla._q_scale,
+                kv_c=kv_c_cache,
+                k_pe=k_pe_cache,
+                kv_cache=kv_cache_storage,
+                slot_mapping=slot_mapping,
+                kv_cache_dtype=mla.kv_cache_dtype,
+                kv_scale=mla._k_scale,
+            )
+        else:
+            mqa_q_final = _run_kimik25_decode_rope_concat_quant_fp8(
+                positions=positions[:num_mqa_tokens],
+                ql_nope=mqa_ql_nope,
+                q_pe=mqa_q_pe,
+                cos_sin_cache=layer.rotary_emb.cos_sin_cache,
+                scale=mla._q_scale,
+            )
+    elif slot_mapping is not None:
+        _run_kimik25_concat_and_cache_mla(
+            kv_c=kv_c_cache,
+            k_pe=k_pe_cache,
+            kv_cache=kv_cache_storage,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype=mla.kv_cache_dtype,
+            scale=mla._k_scale,
+        )
 
     if num_mha_tokens > 0:
         q_pe = q[..., layer.qk_nope_head_dim :]
@@ -425,28 +450,7 @@ def _forked_kimi_mla_attn(
         )
 
     if num_mqa_tokens > 0:
-        mqa_q = q[:num_mqa_tokens]
-        mqa_q_nope, mqa_q_pe = mqa_q.split(
-            [mla.qk_nope_head_dim, mla.qk_rope_head_dim], dim=-1
-        )
-
-        mqa_q_nope = mqa_q_nope.transpose(0, 1)
-        N, B, P = mqa_q_nope.shape
-        _, _, L = mla.W_UK_T.shape
-
-        assert mla.q_pad_num_heads is None, "num_heads padding is unsupported"
-        mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
-
-        torch.bmm(mqa_q_nope, mla.W_UK_T, out=mqa_ql_nope)
-        mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
-
-        mqa_q_final = _run_kimik25_decode_rope_concat_quant_fp8(
-            positions=positions[:num_mqa_tokens],
-            ql_nope=mqa_ql_nope,
-            q_pe=mqa_q_pe,
-            cos_sin_cache=layer.rotary_emb.cos_sin_cache,
-            scale=mla._q_scale,
-        )
+        assert mqa_q_final is not None
 
         decode_attn_out, _ = mla.impl.forward_mqa(
             mqa_q_final, kv_cache, attn_metadata, mla
@@ -1172,6 +1176,235 @@ def kimik25_decode_rope_concat_quant_fp8(
 
 
 @cute.kernel
+def kimik25_decode_rope_concat_quant_fp8_and_cache_mla_kernel(
+    positions: cute.Tensor,  # (B,)
+    ql_nope: cute.Tensor,  # (B, N, q_lora_dim)
+    q_pe: cute.Tensor,  # (B, N, (2, pe_dim // 2))
+    q_out: cute.Tensor,  # uint8 bytes, (B, N, q_lora_dim + pe_dim)
+    cos_sin_cache: cute.Tensor,  # (max_position_embeddings, pe_dim)
+    q_scale: cute.Tensor,  # (1,)
+    kv_c: cute.Tensor,  # (Sp, kv_lora_rank)
+    k_pe: cute.Tensor,  # (Sp, pe_dim)
+    kv_cache: cute.Tensor,  # (num_blocks, block_size, kv_lora_rank + pe_dim)
+    slot_mapping: cute.Tensor,  # (Sp,)
+    kv_scale: cute.Tensor,  # (1,)
+    q_lora_dim: cutlass.Constexpr,
+    kv_lora_rank: cutlass.Constexpr,
+    pe_dim: cutlass.Constexpr,
+    kv_cache_block_factor: cutlass.Constexpr,
+):
+    tid, _, _ = cute.arch.thread_idx()
+    linear_block, _, _ = cute.arch.block_idx()
+
+    kv_cache_splits: cutlass.Constexpr = kv_cache_block_factor + 1
+    num_cache_blocks = slot_mapping.shape[0] * kv_cache_splits
+
+    if linear_block < num_cache_blocks:
+        token_idx = linear_block // kv_cache_splits
+        split_idx = linear_block % kv_cache_splits
+        kv_c_elems_per_split: cutlass.Constexpr = (
+            kv_lora_rank // kv_cache_block_factor
+        )
+
+        slot_idx = slot_mapping[token_idx]
+        if slot_idx >= 0:
+            block_size = kv_cache.shape[1]
+            cache_block_idx = slot_idx // block_size
+            cache_block_offset = slot_idx % block_size
+            scale_value = kv_scale[0].to(cutlass.Float32)
+
+            if split_idx > 0:
+                kv_c_idx = (split_idx - 1) * kv_c_elems_per_split + tid
+                kv_c_val = kv_c[token_idx, kv_c_idx].to(cutlass.Float32)
+                kv_cache[cache_block_idx, cache_block_offset, kv_c_idx] = (
+                    cutlass.Uint8(
+                        _cvt_f32_to_e4m3(kv_c_val / scale_value)
+                        & cutlass.Uint32(0xFF)
+                    )
+                )
+            else:
+                if tid < pe_dim:
+                    k_pe_val = k_pe[token_idx, tid].to(cutlass.Float32)
+                    kv_cache[
+                        cache_block_idx,
+                        cache_block_offset,
+                        kv_lora_rank + tid,
+                    ] = cutlass.Uint8(
+                        _cvt_f32_to_e4m3(k_pe_val / scale_value)
+                        & cutlass.Uint32(0xFF)
+                    )
+    else:
+        decode_block = linear_block - num_cache_blocks
+        q_lora_tiles: cutlass.Constexpr = q_lora_dim // 256
+        decode_tile_count: cutlass.Constexpr = q_lora_tiles + 1
+        block_kind = decode_block % decode_tile_count
+        token_head_block = decode_block // decode_tile_count
+        token_idx = token_head_block // ql_nope.shape[1]
+        head_idx = token_head_block % ql_nope.shape[1]
+
+        scale_value = q_scale[0]
+        ql_nope_paired = cute.logical_divide(ql_nope, (1, 1, 2))
+        q_out_paired = cute.logical_divide(q_out, (1, 1, 2))
+        half_pe_dim: cutlass.Constexpr = pe_dim // 2
+
+        if block_kind < q_lora_tiles:
+            q_pair_idx = block_kind * 128 + tid
+            in_scratch = cute.make_rmem_tensor(2, dtype=cutlass.BFloat16)
+            out_scratch = cute.make_rmem_tensor(2, dtype=cutlass.Uint8)
+            cute.autovec_copy(
+                ql_nope_paired[token_idx, head_idx, (None, q_pair_idx)],
+                in_scratch,
+            )
+            for i in cutlass.range_constexpr(2):
+                q_val = in_scratch[i].to(cutlass.Float32)
+                out_scratch[i] = cutlass.Uint8(
+                    _cvt_f32_to_e4m3(q_val / scale_value) & cutlass.Uint32(0xFF)
+                )
+            cute.autovec_copy(
+                out_scratch,
+                q_out_paired[token_idx, head_idx, (None, q_pair_idx)],
+            )
+        elif tid < half_pe_dim:
+            pos = positions[token_idx]
+            cos = cos_sin_cache[pos, tid]
+            sin = cos_sin_cache[pos, tid + half_pe_dim]
+            in_scratch = cute.make_rmem_tensor(2, dtype=cutlass.BFloat16)
+            out_scratch = cute.make_rmem_tensor(2, dtype=cutlass.Uint8)
+            cute.autovec_copy(q_pe[token_idx, head_idx, (None, tid)], in_scratch)
+            a = in_scratch[0]
+            b = in_scratch[1]
+            qx = (a * cos - b * sin).to(cutlass.BFloat16)
+            qy = (a * sin + b * cos).to(cutlass.BFloat16)
+            out_scratch[0] = cutlass.Uint8(
+                _cvt_f32_to_e4m3(qx.to(cutlass.Float32) / scale_value)
+                & cutlass.Uint32(0xFF)
+            )
+            out_scratch[1] = cutlass.Uint8(
+                _cvt_f32_to_e4m3(qy.to(cutlass.Float32) / scale_value)
+                & cutlass.Uint32(0xFF)
+            )
+            cute.autovec_copy(
+                out_scratch,
+                q_out_paired[token_idx, head_idx, (None, q_lora_dim // 2 + tid)],
+            )
+
+
+@cute.jit
+def kimik25_decode_rope_concat_quant_fp8_and_cache_mla(
+    positions: cute.Tensor,
+    ql_nope: cute.Tensor,
+    q_pe: cute.Tensor,
+    q_out: cute.Tensor,
+    cos_sin_cache: cute.Tensor,
+    q_scale: cute.Tensor,
+    kv_c: cute.Tensor,
+    k_pe: cute.Tensor,
+    kv_cache: cute.Tensor,
+    slot_mapping: cute.Tensor,
+    kv_scale: cute.Tensor,
+    q_lora_dim: cutlass.Constexpr,
+    kv_lora_rank: cutlass.Constexpr,
+    pe_dim: cutlass.Constexpr,
+    kv_cache_block_factor: cutlass.Constexpr,
+    stream: CUstream,
+):
+    assert q_lora_dim == 512
+    assert kv_lora_rank == 512
+    assert pe_dim == 64
+    assert pe_dim % 2 == 0
+    assert kv_cache_block_factor > 0
+    assert kv_lora_rank % kv_cache_block_factor == 0
+    assert kv_lora_rank // kv_cache_block_factor == 128
+    assert q_lora_dim % 256 == 0
+    assert ql_nope.stride[2] == 1
+    assert q_pe.stride[2] == 1
+    assert kv_c.stride[1] == 1
+    assert k_pe.stride[1] == 1
+    assert kv_cache.stride[2] == 1
+
+    sp = positions.shape[0]
+    ql_nope = cute.make_tensor(
+        ql_nope.iterator,
+        cute.make_layout(
+            (sp, ql_nope.shape[1], q_lora_dim),
+            stride=(
+                cute.assume(ql_nope.stride[0], divby=2),
+                cute.assume(ql_nope.stride[1], divby=2),
+                1,
+            ),
+        ),
+    )
+    q_pe = cute.make_tensor(
+        q_pe.iterator,
+        cute.make_layout(
+            (sp, q_pe.shape[1], (2, pe_dim // 2)),
+            stride=(
+                cute.assume(q_pe.stride[0], divby=2),
+                cute.assume(q_pe.stride[1], divby=2),
+                (1, 2),
+            ),
+        ),
+    )
+    q_out = cute.make_tensor(
+        q_out.iterator,
+        cute.make_layout(
+            (sp, q_out.shape[1], q_lora_dim + pe_dim),
+            stride=(
+                cute.assume(q_out.stride[0], divby=2),
+                cute.assume(q_out.stride[1], divby=2),
+                1,
+            ),
+        ),
+    )
+    kv_c = cute.make_tensor(
+        kv_c.iterator,
+        cute.make_layout(
+            (kv_c.shape[0], kv_lora_rank),
+            stride=(kv_c.stride[0], 1),
+        ),
+    )
+    k_pe = cute.make_tensor(
+        k_pe.iterator,
+        cute.make_layout(
+            (k_pe.shape[0], pe_dim),
+            stride=(k_pe.stride[0], 1),
+        ),
+    )
+    kv_cache = cute.make_tensor(
+        kv_cache.iterator,
+        cute.make_layout(
+            (kv_cache.shape[0], kv_cache.shape[1], kv_lora_rank + pe_dim),
+            stride=(kv_cache.stride[0], kv_cache.stride[1], 1),
+        ),
+    )
+
+    q_lora_tiles: cutlass.Constexpr = q_lora_dim // 256
+    decode_blocks = sp * ql_nope.shape[1] * (q_lora_tiles + 1)
+    cache_blocks = slot_mapping.shape[0] * (kv_cache_block_factor + 1)
+    kimik25_decode_rope_concat_quant_fp8_and_cache_mla_kernel(
+        positions,
+        ql_nope,
+        q_pe,
+        q_out,
+        cos_sin_cache,
+        q_scale,
+        kv_c,
+        k_pe,
+        kv_cache,
+        slot_mapping,
+        kv_scale,
+        q_lora_dim,
+        kv_lora_rank,
+        pe_dim,
+        kv_cache_block_factor,
+    ).launch(
+        grid=(cache_blocks + decode_blocks, 1, 1),
+        block=(128, 1, 1),
+        stream=stream,
+    )
+
+
+@cute.kernel
 def kimik25_rmsnorm_special_qkv_split_kernel(
     data: cute.Tensor,  # (Sp, (2, lora_dim_kv // 2, 4))
     weights_q: cute.Tensor,  # (2, lora_dim_q // 2)
@@ -1500,6 +1733,107 @@ def _run_kimik25_decode_rope_concat_quant_fp8(
         q_out=q_out_cute,
         cos_sin_cache=cos_sin_cache_cute,
         scale=scale_cute,
+        stream=cutlass_torch.current_stream(),
+    )
+    return q_out.view(current_platform.fp8_dtype())
+
+
+def _run_kimik25_decode_rope_concat_quant_fp8_and_cache_mla(
+    *,
+    positions: torch.Tensor,
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_c: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    kv_scale: torch.Tensor,
+) -> torch.Tensor:
+    assert kv_cache_dtype in {"fp8", "fp8_e4m3"}
+
+    q_lora_dim = ql_nope.shape[2]
+    kv_lora_rank = kv_c.shape[1]
+    pe_dim = q_pe.shape[2]
+    assert q_lora_dim == 512, "Kimi-K2.5 NVFP4 expects kv_lora_rank=512"
+    assert kv_lora_rank == 512, "Kimi-K2.5 NVFP4 expects kv_lora_rank=512"
+    assert pe_dim == 64, "Kimi-K2.5 NVFP4 expects qk_rope_head_dim=64"
+    assert k_pe.shape[1] == pe_dim
+    assert ql_nope.shape[:2] == q_pe.shape[:2]
+
+    kv_cache_block_factor = 4
+    q_scale = q_scale.view(1)
+    kv_scale = kv_scale.view(1)
+    q_out = torch.empty(
+        (ql_nope.shape[0], ql_nope.shape[1], q_lora_dim + pe_dim),
+        device=ql_nope.device,
+        dtype=torch.uint8,
+    )
+
+    positions_cute = _make_fully_dynamic_cute_tensor(positions)
+    ql_nope_cute = _make_dynamic_cute_tensor(ql_nope)
+    q_pe_cute = _make_fully_dynamic_cute_tensor(q_pe)
+    q_out_cute = _make_dynamic_cute_tensor(q_out)
+    cos_sin_cache_cute = from_dlpack(cos_sin_cache, assumed_align=16)
+    q_scale_cute = from_dlpack(q_scale, assumed_align=4)
+    kv_c_cute = _make_dynamic_cute_tensor(kv_c)
+    k_pe_cute = _make_dynamic_cute_tensor(k_pe)
+    kv_cache_cute = _make_dynamic_cute_tensor(kv_cache)
+    slot_mapping_cute = _make_fully_dynamic_cute_tensor(slot_mapping)
+    kv_scale_cute = from_dlpack(kv_scale, assumed_align=4)
+    cache_key = (
+        "kimik25_decode_rope_concat_quant_fp8_and_cache_mla",
+        _cuda_device_cache_key(),
+        _cutedsl_arg_cache_key(positions_cute),
+        _cutedsl_arg_cache_key(ql_nope_cute),
+        _cutedsl_arg_cache_key(q_pe_cute),
+        _cutedsl_arg_cache_key(q_out_cute),
+        _cutedsl_arg_cache_key(cos_sin_cache_cute),
+        _cutedsl_arg_cache_key(q_scale_cute),
+        _cutedsl_arg_cache_key(kv_c_cute),
+        _cutedsl_arg_cache_key(k_pe_cute),
+        _cutedsl_arg_cache_key(kv_cache_cute),
+        _cutedsl_arg_cache_key(slot_mapping_cute),
+        _cutedsl_arg_cache_key(kv_scale_cute),
+        q_lora_dim,
+        kv_lora_rank,
+        pe_dim,
+        kv_cache_block_factor,
+    )
+    executor = _get_cutedsl_executor(
+        cache_key,
+        kimik25_decode_rope_concat_quant_fp8_and_cache_mla,
+        positions=positions_cute,
+        ql_nope=ql_nope_cute,
+        q_pe=q_pe_cute,
+        q_out=q_out_cute,
+        cos_sin_cache=cos_sin_cache_cute,
+        q_scale=q_scale_cute,
+        kv_c=kv_c_cute,
+        k_pe=k_pe_cute,
+        kv_cache=kv_cache_cute,
+        slot_mapping=slot_mapping_cute,
+        kv_scale=kv_scale_cute,
+        q_lora_dim=q_lora_dim,
+        kv_lora_rank=kv_lora_rank,
+        pe_dim=pe_dim,
+        kv_cache_block_factor=kv_cache_block_factor,
+        stream=cutlass_torch.current_stream(),
+    )
+    executor(
+        positions=positions_cute,
+        ql_nope=ql_nope_cute,
+        q_pe=q_pe_cute,
+        q_out=q_out_cute,
+        cos_sin_cache=cos_sin_cache_cute,
+        q_scale=q_scale_cute,
+        kv_c=kv_c_cute,
+        k_pe=k_pe_cute,
+        kv_cache=kv_cache_cute,
+        slot_mapping=slot_mapping_cute,
+        kv_scale=kv_scale_cute,
         stream=cutlass_torch.current_stream(),
     )
     return q_out.view(current_platform.fp8_dtype())

@@ -1059,34 +1059,52 @@ def kimik25_decode_rope_concat_quant_fp8_kernel(
     pe_dim: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
-    token_idx, head_idx, _ = cute.arch.block_idx()
+    token_idx, head_idx, block_kind = cute.arch.block_idx()
     scale_value = scale[0]
-
-    for tile_idx in cutlass.range_constexpr(q_lora_dim // 256):
-        q_idx = tile_idx * 256 + tidx
-        q_val = ql_nope[token_idx, head_idx, q_idx].to(cutlass.Float32)
-        q_out[token_idx, head_idx, q_idx] = cutlass.Uint8(
-            _cvt_f32_to_e4m3(q_val / scale_value) & cutlass.Uint32(0xFF)
-        )
-
+    q_lora_tiles: cutlass.Constexpr = q_lora_dim // 256
+    ql_nope_paired = cute.logical_divide(ql_nope, (1, 1, 2))
+    q_out_paired = cute.logical_divide(q_out, (1, 1, 2))
     half_pe_dim: cutlass.Constexpr = pe_dim // 2
-    if tidx < half_pe_dim:
+
+    if block_kind < q_lora_tiles:
+        q_pair_idx = block_kind * 128 + tidx
+        in_scratch = cute.make_rmem_tensor(2, dtype=cutlass.BFloat16)
+        out_scratch = cute.make_rmem_tensor(2, dtype=cutlass.Uint8)
+        cute.autovec_copy(
+            ql_nope_paired[token_idx, head_idx, (None, q_pair_idx)],
+            in_scratch,
+        )
+        for i in cutlass.range_constexpr(2):
+            q_val = in_scratch[i].to(cutlass.Float32)
+            out_scratch[i] = cutlass.Uint8(
+                _cvt_f32_to_e4m3(q_val / scale_value) & cutlass.Uint32(0xFF)
+            )
+        cute.autovec_copy(
+            out_scratch,
+            q_out_paired[token_idx, head_idx, (None, q_pair_idx)],
+        )
+    elif tidx < half_pe_dim:
         pos = positions[token_idx]
         cos = cos_sin_cache[pos, tidx]
         sin = cos_sin_cache[pos, tidx + half_pe_dim]
         in_scratch = cute.make_rmem_tensor(2, dtype=cutlass.BFloat16)
+        out_scratch = cute.make_rmem_tensor(2, dtype=cutlass.Uint8)
         cute.autovec_copy(q_pe[token_idx, head_idx, (None, tidx)], in_scratch)
         a = in_scratch[0]
         b = in_scratch[1]
         qx = (a * cos - b * sin).to(cutlass.BFloat16)
         qy = (a * sin + b * cos).to(cutlass.BFloat16)
-        q_out[token_idx, head_idx, q_lora_dim + tidx * 2] = cutlass.Uint8(
+        out_scratch[0] = cutlass.Uint8(
             _cvt_f32_to_e4m3(qx.to(cutlass.Float32) / scale_value)
             & cutlass.Uint32(0xFF)
         )
-        q_out[token_idx, head_idx, q_lora_dim + tidx * 2 + 1] = cutlass.Uint8(
+        out_scratch[1] = cutlass.Uint8(
             _cvt_f32_to_e4m3(qy.to(cutlass.Float32) / scale_value)
             & cutlass.Uint32(0xFF)
+        )
+        cute.autovec_copy(
+            out_scratch,
+            q_out_paired[token_idx, head_idx, (None, q_lora_dim // 2 + tidx)],
         )
 
 
@@ -1107,7 +1125,11 @@ def kimik25_decode_rope_concat_quant_fp8(
         ql_nope.iterator,
         cute.make_layout(
             (sp, ql_nope.shape[1], q_lora_dim),
-            stride=(ql_nope.stride[0], ql_nope.stride[1], 1),
+            stride=(
+                cute.assume(ql_nope.stride[0], divby=2),
+                cute.assume(ql_nope.stride[1], divby=2),
+                1,
+            ),
         ),
     )
     q_pe = cute.make_tensor(
@@ -1125,9 +1147,14 @@ def kimik25_decode_rope_concat_quant_fp8(
         q_out.iterator,
         cute.make_layout(
             (sp, q_out.shape[1], q_lora_dim + pe_dim),
-            stride=(q_out.stride[0], q_out.stride[1], 1),
+            stride=(
+                cute.assume(q_out.stride[0], divby=2),
+                cute.assume(q_out.stride[1], divby=2),
+                1,
+            ),
         ),
     )
+    q_lora_tiles: cutlass.Constexpr = q_lora_dim // 256
     kimik25_decode_rope_concat_quant_fp8_kernel(
         positions,
         ql_nope,
@@ -1138,8 +1165,8 @@ def kimik25_decode_rope_concat_quant_fp8(
         q_lora_dim,
         pe_dim,
     ).launch(
-        grid=(sp, ql_nope.shape[1], 1),
-        block=(256, 1, 1),
+        grid=(sp, ql_nope.shape[1], q_lora_tiles + 1),
+        block=(128, 1, 1),
         stream=stream,
     )
 

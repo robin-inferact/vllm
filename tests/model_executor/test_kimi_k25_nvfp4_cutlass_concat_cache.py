@@ -18,26 +18,14 @@ pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.torch")
 
 from vllm import _custom_ops as ops
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.specialized_models.kimi_k2_5_nvfp4.model import (
     _run_kimik25_concat_and_cache_mla,
 )
 
 KERNEL_ATOL = 2e-2
-ROPE_PARAMETERS = {
-    "rope_type": "deepseek_yarn",
-    "rope_theta": 50000.0,
-    "factor": 64.0,
-    "beta_fast": 32.0,
-    "beta_slow": 1.0,
-    "mscale": 1.0,
-    "mscale_all_dim": 1.0,
-    "original_max_position_embeddings": 4096,
-}
-
 
 @torch.inference_mode()
-def test_kimik25_cutlass_concat_and_cache_mla_matches_rope_fused_cuda_op() -> None:
+def test_kimik25_cutlass_concat_and_cache_mla_matches_cuda_op() -> None:
     torch.manual_seed(0)
 
     num_tokens = 7
@@ -45,22 +33,6 @@ def test_kimik25_cutlass_concat_and_cache_mla_matches_rope_fused_cuda_op() -> No
     block_size = 16
     kv_lora_rank = 512
     pe_dim = 64
-    max_position = 262144
-
-    rope = get_rope(
-        head_size=pe_dim,
-        max_position=max_position,
-        is_neox_style=False,
-        rope_parameters=ROPE_PARAMETERS,
-        dtype=torch.bfloat16,
-    ).to(device="cuda", dtype=torch.bfloat16)
-    positions = torch.randint(
-        0,
-        max_position,
-        (num_tokens,),
-        device="cuda",
-        dtype=torch.long,
-    )
 
     slot_mapping = torch.tensor(
         [0, 3, -1, 17, 31, 44, 55],
@@ -88,13 +60,6 @@ def test_kimik25_cutlass_concat_and_cache_mla_matches_rope_fused_cuda_op() -> No
     scale = torch.tensor(0.02, device="cuda", dtype=torch.float32)
 
     expected_k_pe = k_pe.clone()
-    expected_q_pe = torch.randn(
-        num_tokens,
-        1,
-        pe_dim,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
     actual_k_pe = k_pe.clone()
 
     expected = torch.empty(
@@ -108,24 +73,18 @@ def test_kimik25_cutlass_concat_and_cache_mla_matches_rope_fused_cuda_op() -> No
     expected.fill_(123)
     actual.fill_(123)
 
-    ops.concat_and_cache_mla_rope_fused(
-        positions,
-        expected_q_pe,
-        expected_k_pe,
+    ops.concat_and_cache_mla(
         kv_c,
-        rope.cos_sin_cache,
-        False,
-        slot_mapping,
+        expected_k_pe,
         expected,
-        "fp8",
-        scale,
+        slot_mapping,
+        kv_cache_dtype="fp8",
+        scale=scale,
     )
     _run_kimik25_concat_and_cache_mla(
-        positions=positions,
         kv_c=kv_c,
         k_pe=actual_k_pe,
         kv_cache=actual,
-        cos_sin_cache=rope.cos_sin_cache,
         slot_mapping=slot_mapping,
         kv_cache_dtype="fp8",
         scale=scale,

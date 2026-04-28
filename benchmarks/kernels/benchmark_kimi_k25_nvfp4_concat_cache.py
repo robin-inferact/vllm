@@ -1,24 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Microbenchmark the Kimi-K2.5 fused MLA concat/cache kernel.
+"""Microbenchmark the Kimi-K2.5 MLA concat/cache kernel.
 
 This benchmark isolates the KV-cache update used by the specialized Kimi-K2.5
-NVFP4 path after query RoPE has already run:
+NVFP4 path after KV RoPE has already run:
 
     kv_c:  [num_tokens, kv_lora_rank]
     k_pe:  [num_tokens, qk_rope_head_dim]
     cache: [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
 
-The CuTeDSL version rotates `k_pe` in place and writes the rotated key into the
-FP8 MLA KV cache. The CUDA fused baseline uses vLLM's existing
-`concat_and_cache_mla_rope_fused` op and a minimal dummy query RoPE input, so it
-does a little extra query work by design.
+The CuTeDSL version writes the already-rotated `k_pe` into the FP8 MLA KV cache.
 
 Example:
 
     .venv/bin/python benchmarks/kernels/benchmark_kimi_k25_nvfp4_concat_cache.py \
-        --versions cutedsl cuda_rope_fused --num-tokens 7 64 512 4096 \
+        --versions cutedsl cuda --num-tokens 7 64 512 4096 \
         --check-correctness
 
     .venv/bin/python benchmarks/kernels/benchmark_kimi_k25_nvfp4_concat_cache.py \
@@ -33,29 +30,16 @@ from typing import Any
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.platforms import current_platform
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.torch_utils import set_random_seed
 
 KV_LORA_RANK = 512
 QK_ROPE_HEAD_DIM = 64
-MAX_POSITION = 262144
 BLOCK_SIZE = 16
 DTYPE = torch.bfloat16
 KV_CACHE_DTYPE = "fp8"
 KV_CACHE_SCALE = 0.02
-ROPE_PARAMETERS = {
-    "rope_type": "deepseek_yarn",
-    "rope_theta": 50000.0,
-    "factor": 64.0,
-    "beta_fast": 32.0,
-    "beta_slow": 1.0,
-    "mscale": 1.0,
-    "mscale_all_dim": 1.0,
-    "original_max_position_embeddings": 4096,
-}
 
 
 @dataclass(frozen=True)
@@ -64,8 +48,6 @@ class BenchmarkConfig:
     kv_lora_rank: int = KV_LORA_RANK
     qk_rope_head_dim: int = QK_ROPE_HEAD_DIM
     block_size: int = BLOCK_SIZE
-    max_position_embeddings: int = MAX_POSITION
-    num_q_heads_for_cuda_baseline: int = 1
     dtype: torch.dtype = DTYPE
 
     @property
@@ -83,33 +65,22 @@ class BenchmarkConfig:
         return self.num_tokens * (
             self.kv_lora_rank * elem_size
             + self.qk_rope_head_dim * elem_size
-            + self.qk_rope_head_dim * elem_size
-            + self.qk_rope_head_dim * elem_size
             + self.entry_size
-            + 2 * long_size
+            + long_size
         )
 
     @property
-    def cuda_rope_fused_bytes_per_call(self) -> int:
-        elem_size = torch.tensor([], dtype=self.dtype).element_size()
-        q_elems = (
-            self.num_tokens
-            * self.num_q_heads_for_cuda_baseline
-            * self.qk_rope_head_dim
-        )
-        return self.cutedsl_bytes_per_call + 3 * q_elems * elem_size
+    def cuda_bytes_per_call(self) -> int:
+        return self.cutedsl_bytes_per_call
 
 
 @dataclass
 class ConcatCacheInputs:
-    positions: torch.Tensor
-    q_pe: torch.Tensor
     kv_c: torch.Tensor
     k_pe: torch.Tensor
     kv_cache: torch.Tensor
     slot_mapping: torch.Tensor
     scale: torch.Tensor
-    cos_sin_cache: torch.Tensor
 
 
 @dataclass
@@ -123,46 +94,14 @@ class KernelVersion:
 _KERNEL_VERSION_CACHE: dict[str, KernelVersion] = {}
 
 
-def _make_rope_module(cfg: BenchmarkConfig):
-    with set_current_vllm_config(VllmConfig()):
-        rope = get_rope(
-            head_size=cfg.qk_rope_head_dim,
-            max_position=cfg.max_position_embeddings,
-            is_neox_style=False,
-            rope_parameters=ROPE_PARAMETERS.copy(),
-            dtype=cfg.dtype,
-        )
-    return rope.to(device="cuda", dtype=cfg.dtype)
-
-
 def _make_inputs(
     cfg: BenchmarkConfig,
-    cos_sin_cache: torch.Tensor,
     *,
-    positions: torch.Tensor | None = None,
     slot_mapping: torch.Tensor | None = None,
 ) -> ConcatCacheInputs:
-    if positions is None:
-        positions = torch.randint(
-            0,
-            cfg.max_position_embeddings,
-            (cfg.num_tokens,),
-            device="cuda",
-            dtype=torch.long,
-        )
     if slot_mapping is None:
         slot_mapping = torch.arange(cfg.num_tokens, device="cuda", dtype=torch.long)
 
-    q_pe = (
-        torch.randn(
-            cfg.num_tokens,
-            cfg.num_q_heads_for_cuda_baseline,
-            cfg.qk_rope_head_dim,
-            device="cuda",
-            dtype=cfg.dtype,
-        )
-        * 0.3
-    )
     kv_c = (
         torch.randn(
             cfg.num_tokens,
@@ -190,33 +129,26 @@ def _make_inputs(
     )
     scale = torch.tensor(KV_CACHE_SCALE, device="cuda", dtype=torch.float32)
     return ConcatCacheInputs(
-        positions=positions,
-        q_pe=q_pe,
         kv_c=kv_c,
         k_pe=k_pe,
         kv_cache=kv_cache,
         slot_mapping=slot_mapping,
         scale=scale,
-        cos_sin_cache=cos_sin_cache,
     )
 
 
-def _run_cuda_rope_fused(inputs: ConcatCacheInputs, cfg: BenchmarkConfig) -> None:
-    ops.concat_and_cache_mla_rope_fused(
-        inputs.positions,
-        inputs.q_pe,
-        inputs.k_pe,
+def _run_cuda(inputs: ConcatCacheInputs, cfg: BenchmarkConfig) -> None:
+    ops.concat_and_cache_mla(
         inputs.kv_c,
-        inputs.cos_sin_cache,
-        False,
-        inputs.slot_mapping,
+        inputs.k_pe,
         inputs.kv_cache,
-        KV_CACHE_DTYPE,
-        inputs.scale,
+        inputs.slot_mapping,
+        kv_cache_dtype=KV_CACHE_DTYPE,
+        scale=inputs.scale,
     )
 
 
-def _make_cuda_rope_fused_runner(
+def _make_cuda_runner(
     inputs_pool: list[ConcatCacheInputs],
     cfg: BenchmarkConfig,
 ):
@@ -224,18 +156,18 @@ def _make_cuda_rope_fused_runner(
 
     def run() -> None:
         nonlocal index
-        _run_cuda_rope_fused(inputs_pool[index], cfg)
+        _run_cuda(inputs_pool[index], cfg)
         index = (index + 1) % len(inputs_pool)
 
     return run
 
 
-def _build_cuda_rope_fused_version() -> KernelVersion:
+def _build_cuda_version() -> KernelVersion:
     return KernelVersion(
-        name="cuda_rope_fused",
-        make_runner=_make_cuda_rope_fused_runner,
-        run_once=_run_cuda_rope_fused,
-        bytes_per_call=lambda cfg: cfg.cuda_rope_fused_bytes_per_call,
+        name="cuda",
+        make_runner=_make_cuda_runner,
+        run_once=_run_cuda,
+        bytes_per_call=lambda cfg: cfg.cuda_bytes_per_call,
     )
 
 
@@ -259,11 +191,9 @@ def _build_cutedsl_version() -> KernelVersion:
                 f"got {cfg.qk_rope_head_dim}."
             )
         _run_kimik25_concat_and_cache_mla(
-            positions=inputs.positions,
             kv_c=inputs.kv_c,
             k_pe=inputs.k_pe,
             kv_cache=inputs.kv_cache,
-            cos_sin_cache=inputs.cos_sin_cache,
             slot_mapping=inputs.slot_mapping,
             kv_cache_dtype=KV_CACHE_DTYPE,
             scale=inputs.scale,
@@ -292,7 +222,7 @@ def _build_cutedsl_version() -> KernelVersion:
 
 KERNEL_VERSION_BUILDERS = {
     "cutedsl": _build_cutedsl_version,
-    "cuda_rope_fused": _build_cuda_rope_fused_version,
+    "cuda": _build_cuda_version,
 }
 
 
@@ -404,20 +334,16 @@ def _dequantize_cache(cache: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 def _run_correctness(
     version: KernelVersion,
     cfg: BenchmarkConfig,
-    cos_sin_cache: torch.Tensor,
 ) -> float:
-    reference_inputs = _make_inputs(cfg, cos_sin_cache)
+    reference_inputs = _make_inputs(cfg)
     actual_inputs = _make_inputs(
         cfg,
-        cos_sin_cache,
-        positions=reference_inputs.positions,
         slot_mapping=reference_inputs.slot_mapping,
     )
-    actual_inputs.q_pe.copy_(reference_inputs.q_pe)
     actual_inputs.kv_c.copy_(reference_inputs.kv_c)
     actual_inputs.k_pe.copy_(reference_inputs.k_pe)
 
-    _run_cuda_rope_fused(reference_inputs, cfg)
+    _run_cuda(reference_inputs, cfg)
     version.run_once(actual_inputs, cfg)
     torch.cuda.synchronize()
 
@@ -454,7 +380,7 @@ def main(args) -> None:
     version_col_width = max(len("version"), max(len(name) for name in version_names))
     header = (
         f"{'version':<{version_col_width}} "
-        f"{'tokens':>8} {'blocks':>8} {'block':>6} {'q_heads':>8} "
+        f"{'tokens':>8} {'blocks':>8} {'block':>6} "
         f"{'median_us':>12} {'min_us':>12} {'max_us':>12} {'gbps':>10} "
         f"{'speedup':>10} {'max_abs_diff':>14}"
     )
@@ -465,10 +391,8 @@ def main(args) -> None:
         cfg = BenchmarkConfig(
             num_tokens=num_tokens,
             block_size=args.block_size,
-            num_q_heads_for_cuda_baseline=args.num_q_heads_for_cuda_baseline,
         )
-        rope = _make_rope_module(cfg)
-        sample_inputs = _make_inputs(cfg, rope.cos_sin_cache)
+        sample_inputs = _make_inputs(cfg)
 
         diffs: dict[str, float | None] = {}
         if args.check_correctness:
@@ -476,7 +400,6 @@ def main(args) -> None:
                 diffs[version_name] = _run_correctness(
                     versions[version_name],
                     cfg,
-                    rope.cos_sin_cache,
                 )
         else:
             diffs = {version_name: None for version_name in version_names}
@@ -489,8 +412,6 @@ def main(args) -> None:
             data_pool = [
                 _make_inputs(
                     cfg,
-                    rope.cos_sin_cache,
-                    positions=sample_inputs.positions,
                     slot_mapping=sample_inputs.slot_mapping,
                 )
                 for _ in range(args.num_buffers)
@@ -521,7 +442,6 @@ def main(args) -> None:
                 f"{num_tokens:>8d} "
                 f"{cfg.num_blocks:>8d} "
                 f"{cfg.block_size:>6d} "
-                f"{cfg.num_q_heads_for_cuda_baseline:>8d} "
                 f"{median_us:>12.2f} "
                 f"{mins_us[version_name]:>12.2f} "
                 f"{maxs_us[version_name]:>12.2f} "
@@ -565,15 +485,6 @@ if __name__ == "__main__":
         help="KV-cache block size.",
     )
     parser.add_argument(
-        "--num-q-heads-for-cuda-baseline",
-        type=int,
-        default=1,
-        help=(
-            "Number of dummy query heads passed to the CUDA rope-fused baseline. "
-            "Use 64 to include the full Kimi query RoPE work in that baseline."
-        ),
-    )
-    parser.add_argument(
         "--num-warmup-iters",
         type=int,
         default=20,
@@ -603,7 +514,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--check-correctness",
         action="store_true",
-        help="Compare each kernel against the CUDA rope-fused cache reference.",
+        help="Compare each kernel against the CUDA cache reference.",
     )
     parser.add_argument(
         "--use-cudagraph",

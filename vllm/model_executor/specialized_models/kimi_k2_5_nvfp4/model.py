@@ -101,7 +101,13 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 _TARGET_MODEL_NAMES = {"nvidia/Kimi-K2.5-NVFP4"}
 logger = init_logger(__name__)
 
-_KIMI_MOE_FINALIZE_AR_WORLD_SIZES = {2, 4, 8, 16}
+_KIMI_TRTLLM_AR_WORLD_SIZES = {2, 4, 8, 16}
+_KIMI_MOE_FINALIZE_AR_WORLD_SIZES = _KIMI_TRTLLM_AR_WORLD_SIZES
+_kimi_attention_ar_workspace: Any | None = None
+_kimi_attention_ar_workspace_key: tuple[int, int, int, torch.dtype, int] | None = None
+_kimi_attention_ar_workspace_max_tokens = 0
+_kimi_attention_ar_workspace_disabled = False
+_kimi_attention_ar_workspace_lock = threading.Lock()
 _kimi_moe_finalize_ar_workspace: Any | None = None
 _kimi_moe_finalize_ar_workspace_key: tuple[int, int, int, torch.dtype, int] | None = (
     None
@@ -109,6 +115,25 @@ _kimi_moe_finalize_ar_workspace_key: tuple[int, int, int, torch.dtype, int] | No
 _kimi_moe_finalize_ar_workspace_max_tokens = 0
 _kimi_moe_finalize_ar_workspace_disabled = False
 _kimi_moe_finalize_ar_workspace_lock = threading.Lock()
+
+
+def _destroy_kimi_attention_ar_workspace() -> None:
+    global _kimi_attention_ar_workspace
+    global _kimi_attention_ar_workspace_key
+    global _kimi_attention_ar_workspace_max_tokens
+
+    workspace = _kimi_attention_ar_workspace
+    _kimi_attention_ar_workspace = None
+    _kimi_attention_ar_workspace_key = None
+    _kimi_attention_ar_workspace_max_tokens = 0
+    if workspace is not None:
+        try:
+            workspace.destroy()
+        except Exception:
+            logger.debug(
+                "Failed to destroy Kimi-K2.5 attention all-reduce workspace.",
+                exc_info=True,
+            )
 
 
 def _destroy_kimi_moe_finalize_ar_workspace() -> None:
@@ -130,7 +155,78 @@ def _destroy_kimi_moe_finalize_ar_workspace() -> None:
             )
 
 
+atexit.register(_destroy_kimi_attention_ar_workspace)
 atexit.register(_destroy_kimi_moe_finalize_ar_workspace)
+
+
+def _get_kimi_attention_ar_workspace(
+    *,
+    world_size: int,
+    rank: int,
+    max_token_num: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    group: Any,
+) -> Any | None:
+    global _kimi_attention_ar_workspace
+    global _kimi_attention_ar_workspace_key
+    global _kimi_attention_ar_workspace_max_tokens
+    global _kimi_attention_ar_workspace_disabled
+
+    if get_node_count() > 1:
+        logger.warning_once(
+            "FlashInfer TRTLLM attention all-reduce fusion is not supported "
+            "for multi-node tensor-parallel groups."
+        )
+        _kimi_attention_ar_workspace_disabled = True
+        return None
+    if _kimi_attention_ar_workspace_disabled:
+        return None
+
+    key = (world_size, rank, hidden_dim, dtype, id(group))
+    with _kimi_attention_ar_workspace_lock:
+        workspace = _kimi_attention_ar_workspace
+        if (
+            workspace is not None
+            and _kimi_attention_ar_workspace_key == key
+            and _kimi_attention_ar_workspace_max_tokens >= max_token_num
+            and workspace.is_buffer_size_sufficient(
+                world_size,
+                max_token_num,
+                hidden_dim,
+                dtype,
+            )
+        ):
+            return workspace
+
+        if workspace is not None and current_platform.is_cuda():
+            torch.cuda.synchronize()
+        _destroy_kimi_attention_ar_workspace()
+        workspace = _create_flashinfer_allreduce_workspace(
+            "trtllm",
+            world_size,
+            rank,
+            max_token_num,
+            hidden_dim,
+            dtype,
+            group,
+        )
+        if workspace is None:
+            _kimi_attention_ar_workspace_disabled = True
+            logger.warning_once(
+                "Failed to initialize Kimi-K2.5 attention all-reduce "
+                "workspace; falling back to separate all-reduce and RMSNorm."
+            )
+            return None
+
+        _kimi_attention_ar_workspace = workspace
+        _kimi_attention_ar_workspace_key = key
+        _kimi_attention_ar_workspace_max_tokens = max_token_num
+        logger.info_once(
+            "Initialized Kimi-K2.5 attention all-reduce workspace "
+            "with backend=trtllm."
+        )
+        return workspace
 
 
 def _get_kimi_moe_finalize_ar_workspace(
@@ -708,6 +804,7 @@ class KimiK25Nvfp4MLAAttention(nn.Module):
         cache_config,
         quant_config,
         prefix: str,
+        reduce_o_proj: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -749,7 +846,9 @@ class KimiK25Nvfp4MLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            reduce_results=reduce_o_proj,
         )
+        self.reduce_o_proj = reduce_o_proj
 
         if config.rope_parameters["rope_type"] != "default":
             config.rope_parameters["rope_type"] = (
@@ -2056,6 +2155,7 @@ class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
         cache_config,
         quant_config,
         prefix: str,
+        reduce_o_proj: bool = True,
     ) -> None:
         print("Initializing ForkedKimiK25Nvfp4MLAAttention")
         super().__init__(
@@ -2064,6 +2164,7 @@ class ForkedKimiK25Nvfp4MLAAttention(KimiK25Nvfp4MLAAttention):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=prefix,
+            reduce_o_proj=reduce_o_proj,
         )
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -2144,6 +2245,118 @@ class _KimiK25SharedExpertOverlap:
         assert output is not None
         self.outputs[idx] = None
         return output
+
+
+def _fallback_attention_allreduce_norm(
+    allreduce_in: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+) -> None:
+    allreduce_out = tensor_model_parallel_all_reduce(allreduce_in)
+    result = RMSNorm.forward_static(
+        allreduce_out,
+        norm_eps,
+        int(norm_weight.shape[0]),
+        allreduce_out.dtype,
+        weight=norm_weight,
+        residual=residual,
+    )
+    assert isinstance(result, tuple)
+    norm_out, residual_out = result
+    if norm_out.data_ptr() != allreduce_in.data_ptr():
+        allreduce_in.copy_(norm_out)
+    if residual_out.data_ptr() != residual.data_ptr():
+        residual.copy_(residual_out)
+
+
+def _kimi_k25_nvfp4_attention_allreduce_norm(
+    allreduce_in: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    max_token_num: int,
+) -> None:
+    try:
+        import flashinfer.comm as flashinfer_comm
+    except ImportError:
+        return _fallback_attention_allreduce_norm(
+            allreduce_in,
+            residual,
+            norm_weight,
+            norm_eps,
+        )
+    if not hasattr(flashinfer_comm, "trtllm_allreduce_fusion"):
+        return _fallback_attention_allreduce_norm(
+            allreduce_in,
+            residual,
+            norm_weight,
+            norm_eps,
+        )
+
+    token_num, hidden_dim = allreduce_in.shape
+    tp_group = get_tp_group()
+    workspace = _get_kimi_attention_ar_workspace(
+        world_size=tp_group.world_size,
+        rank=tp_group.rank_in_group,
+        max_token_num=max(max_token_num, token_num),
+        hidden_dim=hidden_dim,
+        dtype=allreduce_in.dtype,
+        group=tp_group.device_group,
+    )
+    if workspace is None:
+        return _fallback_attention_allreduce_norm(
+            allreduce_in,
+            residual,
+            norm_weight,
+            norm_eps,
+        )
+
+    flashinfer_comm.trtllm_allreduce_fusion(
+        allreduce_in=allreduce_in.view(-1),
+        world_size=tp_group.world_size,
+        world_rank=tp_group.rank_in_group,
+        token_num=token_num,
+        hidden_dim=hidden_dim,
+        workspace_ptrs=workspace.workspace_tensor,
+        launch_with_pdl=True,
+        trigger_completion_at_end=False,
+        fp32_acc=True,
+        pattern_code=flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
+        use_oneshot=None,
+        allreduce_out=None,
+        residual_in=residual.view(-1),
+        residual_out=residual.view(-1),
+        norm_out=allreduce_in.view(-1),
+        quant_out=None,
+        scale_out=None,
+        rms_gamma=norm_weight,
+        rms_eps=norm_eps,
+        scale_factor=None,
+        layout_code=None,
+        metadata=workspace.metadata,
+    )
+    return None
+
+
+def _kimi_k25_nvfp4_attention_allreduce_norm_fake(
+    allreduce_in: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    max_token_num: int,
+) -> None:
+    del allreduce_in, residual, norm_weight, norm_eps, max_token_num
+    return None
+
+
+direct_register_custom_op(
+    op_name="kimi_k25_nvfp4_attention_allreduce_norm",
+    op_func=_kimi_k25_nvfp4_attention_allreduce_norm,
+    mutates_args=["allreduce_in", "residual"],
+    fake_impl=_kimi_k25_nvfp4_attention_allreduce_norm_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
 
 
 def _kimi_k25_nvfp4_moe(
@@ -2850,6 +3063,9 @@ class KimiK25Nvfp4DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.max_num_batched_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens or 1
+        )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
         cache_config = vllm_config.cache_config
@@ -2866,6 +3082,7 @@ class KimiK25Nvfp4DecoderLayer(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
+            reduce_o_proj=False,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
@@ -2929,7 +3146,10 @@ class KimiK25Nvfp4DecoderLayer(nn.Module):
         assert residual is not None
         hidden_states = self.self_attn(positions, hidden_states)
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual = self._post_attention_allreduce_norm(
+            hidden_states,
+            residual,
+        )
         if (
             next_input_layernorm is not None
             and self.is_moe
@@ -2945,6 +3165,48 @@ class KimiK25Nvfp4DecoderLayer(nn.Module):
 
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual, False
+
+    def _can_use_trtllm_attention_allreduce_norm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> bool:
+        if _kimi_attention_ar_workspace_disabled:
+            return False
+        if get_tensor_model_parallel_world_size() == 1:
+            return False
+        if not current_platform.is_cuda() or not hidden_states.is_cuda:
+            return False
+        if hidden_states.dtype not in (torch.float16, torch.bfloat16):
+            return False
+        if hidden_states.dim() != 2 or residual.dim() != 2:
+            return False
+        if not hidden_states.is_contiguous() or not residual.is_contiguous():
+            return False
+        if self.post_attention_layernorm.variance_size_override is not None:
+            return False
+        if not self.post_attention_layernorm.weight.is_contiguous():
+            return False
+        return get_tp_group().world_size in _KIMI_TRTLLM_AR_WORLD_SIZES
+
+    def _post_attention_allreduce_norm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._can_use_trtllm_attention_allreduce_norm(hidden_states, residual):
+            torch.ops.vllm.kimi_k25_nvfp4_attention_allreduce_norm(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                float(self.post_attention_layernorm.variance_epsilon),
+                int(self.max_num_batched_tokens),
+            )
+            return hidden_states, residual
+
+        if get_tensor_model_parallel_world_size() > 1:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        return self.post_attention_layernorm(hidden_states, residual)
 
     def fuse_shared_expert_act_quant(self) -> None:
         if not self.is_moe:

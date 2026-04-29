@@ -2411,6 +2411,7 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
         routed_scaling_factor: float,
         do_finalize: bool,
         output: torch.Tensor | None,
+        expert_weights: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
         quant_config = self.quant_method.moe_quant_config
         if quant_config is None:
@@ -2447,39 +2448,42 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
         if routing_bias is not None:
             routing_bias = routing_bias.to(torch.bfloat16)
 
-        import flashinfer
+        from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
 
-        return flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
-            routing_logits=router_logits.to(torch.float32),
-            routing_bias=routing_bias,
-            hidden_states=hidden_states,
-            hidden_states_scale=hidden_states_scale.view(torch.float8_e4m3fn).reshape(
+        return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
+            router_logits.to(torch.float32),
+            None,
+            expert_weights,
+            routing_bias,
+            hidden_states,
+            hidden_states_scale.view(torch.float8_e4m3fn).reshape(
                 *hidden_states.shape[:-1], -1
             ),
-            gemm1_weights=self.w13_weight,
-            gemm1_weights_scale=quant_config.w1_scale.view(torch.float8_e4m3fn),
-            gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
-            gemm2_weights=self.w2_weight,
-            gemm2_weights_scale=quant_config.w2_scale.view(torch.float8_e4m3fn),
-            gemm2_bias=None,
-            output1_scale_scalar=self.g1_scale_c,
-            output1_scale_gate_scalar=quant_config.g1_alphas,
-            output2_scale_scalar=quant_config.g2_alphas,
-            num_experts=self.global_num_experts,
-            top_k=self.top_k,
-            n_group=self.num_expert_group,
-            topk_group=self.topk_group,
-            intermediate_size=self.moe_config.intermediate_size_per_partition,
-            local_expert_offset=self.local_expert_offset,
-            local_num_experts=self.local_num_experts,
-            routed_scaling_factor=routed_scaling_factor,
-            routing_method_type=self.routing_method_type,
-            do_finalize=do_finalize,
-            activation_type=self.activation_type,
-            output=output,
+            self.w13_weight,
+            quant_config.w1_scale.view(torch.float8_e4m3fn),
+            None,
+            None,
+            None,
+            None,
+            self.w2_weight,
+            quant_config.w2_scale.view(torch.float8_e4m3fn),
+            None,
+            self.g1_scale_c,
+            quant_config.g1_alphas,
+            quant_config.g2_alphas,
+            self.global_num_experts,
+            self.top_k,
+            self.num_expert_group,
+            self.topk_group,
+            self.moe_config.intermediate_size_per_partition,
+            self.local_expert_offset,
+            self.local_num_experts,
+            routed_scaling_factor,
+            self.routing_method_type,
+            do_finalize,
+            None,
+            self.activation_type,
+            output,
         )
 
     def forward(
@@ -2509,12 +2513,16 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
         *,
         routed_scaling_factor: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        expert_weights = hidden_states.new_empty(
+            (hidden_states.shape[0], self.top_k),
+        )
         result = self._run_flashinfer_trtllm_moe(
             hidden_states,
             router_logits,
             routed_scaling_factor=routed_scaling_factor,
             do_finalize=False,
             output=None,
+            expert_weights=expert_weights,
         )
         if len(result) != 3:
             raise RuntimeError(
@@ -2532,6 +2540,12 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
                 "FlashInfer TRTLLM NVFP4 MoE returned an unexpected "
                 "expanded-index shape for do_finalize=False: "
                 f"{tuple(expanded_idx_to_permuted_idx.shape)}."
+            )
+        if result[1].dtype != expert_weights.dtype:
+            raise RuntimeError(
+                "FlashInfer TRTLLM NVFP4 MoE returned an unexpected "
+                "expert-weight dtype for do_finalize=False: "
+                f"{result[1].dtype}, expected {expert_weights.dtype}."
             )
         return result[0], result[1], expanded_idx_to_permuted_idx
 
@@ -2730,12 +2744,8 @@ class KimiK25Nvfp4MoE(nn.Module):
         ) = self.experts.forward_unfinalized(
             hidden_states,
             router_logits,
-            routed_scaling_factor=1.0,
+            routed_scaling_factor=float(self.routed_scaling_factor),
         )
-        if self.routed_scaling_factor != 1.0:
-            expert_weights = expert_weights * self.routed_scaling_factor
-        if expert_weights.dtype != hidden_states.dtype:
-            expert_weights = expert_weights.to(hidden_states.dtype)
 
         shared_output = None
         if self.shared_expert_overlap is not None:

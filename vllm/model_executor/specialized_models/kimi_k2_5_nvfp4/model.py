@@ -86,6 +86,7 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.flashinfer import (
+    flashinfer_fp4_quantize,
     flashinfer_scaled_fp4_mm,
     has_flashinfer_trtllm_fused_moe,
 )
@@ -2613,10 +2614,13 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
             )
 
         assert quant_config.a1_gscale is not None
-        hidden_states, hidden_states_scale = ops.scaled_fp4_quant(
+        hidden_states, hidden_states_scale = flashinfer_fp4_quantize(
             hidden_states,
             quant_config.a1_gscale,
+            sf_vec_size=16,
+            sf_use_ue8m0=False,
             is_sf_swizzled_layout=False,
+            is_sf_8x4_layout=False,
         )
         assert hidden_states_scale is not None
         assert quant_config.w1_scale is not None
@@ -2626,8 +2630,6 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
         assert hasattr(self, "g1_scale_c")
 
         routing_bias = self.e_score_correction_bias
-        if routing_bias is not None:
-            routing_bias = routing_bias.to(torch.bfloat16)
 
         from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
 
@@ -2767,7 +2769,7 @@ class KimiK25Nvfp4MoE(nn.Module):
         )
         if getattr(config, "topk_method", None) == "noaux_tc":
             self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, dtype=torch.float32)
+                torch.empty(config.n_routed_experts, dtype=torch.bfloat16)
             )
         else:
             raise ValueError("Kimi-K2.5 NVFP4 MoE requires noaux_tc routing.")

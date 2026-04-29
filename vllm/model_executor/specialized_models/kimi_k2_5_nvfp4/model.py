@@ -2037,119 +2037,27 @@ class _KimiK25SharedExpertOverlap:
         return output
 
 
-def _kimi_k25_nvfp4_trtllm_moe(
-    routing_logits: torch.Tensor,
-    routing_bias: torch.Tensor | None,
+def _kimi_k25_nvfp4_moe(
     hidden_states: torch.Tensor,
-    hidden_states_scale: torch.Tensor,
-    gemm1_weights: torch.Tensor,
-    gemm1_weights_scale: torch.Tensor,
-    gemm2_weights: torch.Tensor,
-    gemm2_weights_scale: torch.Tensor,
-    output1_scale_scalar: torch.Tensor,
-    output1_scale_gate_scalar: torch.Tensor,
-    output2_scale_scalar: torch.Tensor,
-    output_template: torch.Tensor,
-    num_experts: int,
-    top_k: int,
-    n_group: int,
-    topk_group: int,
-    intermediate_size: int,
-    local_expert_offset: int,
-    local_num_experts: int,
-    routing_method_type: int,
-    activation_type: int,
+    layer_name: str,
 ) -> torch.Tensor:
-    import flashinfer
-
-    output = torch.empty_like(output_template)
-    result = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
-        routing_logits=routing_logits,
-        routing_bias=routing_bias,
-        hidden_states=hidden_states,
-        hidden_states_scale=hidden_states_scale,
-        gemm1_weights=gemm1_weights,
-        gemm1_weights_scale=gemm1_weights_scale,
-        gemm1_bias=None,
-        gemm1_alpha=None,
-        gemm1_beta=None,
-        gemm1_clamp_limit=None,
-        gemm2_weights=gemm2_weights,
-        gemm2_weights_scale=gemm2_weights_scale,
-        gemm2_bias=None,
-        output1_scale_scalar=output1_scale_scalar,
-        output1_scale_gate_scalar=output1_scale_gate_scalar,
-        output2_scale_scalar=output2_scale_scalar,
-        num_experts=num_experts,
-        top_k=top_k,
-        n_group=n_group,
-        topk_group=topk_group,
-        intermediate_size=intermediate_size,
-        local_expert_offset=local_expert_offset,
-        local_num_experts=local_num_experts,
-        routed_scaling_factor=1.0,
-        routing_method_type=routing_method_type,
-        do_finalize=True,
-        activation_type=activation_type,
-        output=output,
-    )[0]
-    if result.data_ptr() != output.data_ptr():
-        output.copy_(result)
-    return output
+    layer = get_forward_context().no_compile_layers[layer_name]
+    return layer._forward_impl(hidden_states)
 
 
-def _kimi_k25_nvfp4_trtllm_moe_fake(
-    routing_logits: torch.Tensor,
-    routing_bias: torch.Tensor | None,
+def _kimi_k25_nvfp4_moe_fake(
     hidden_states: torch.Tensor,
-    hidden_states_scale: torch.Tensor,
-    gemm1_weights: torch.Tensor,
-    gemm1_weights_scale: torch.Tensor,
-    gemm2_weights: torch.Tensor,
-    gemm2_weights_scale: torch.Tensor,
-    output1_scale_scalar: torch.Tensor,
-    output1_scale_gate_scalar: torch.Tensor,
-    output2_scale_scalar: torch.Tensor,
-    output_template: torch.Tensor,
-    num_experts: int,
-    top_k: int,
-    n_group: int,
-    topk_group: int,
-    intermediate_size: int,
-    local_expert_offset: int,
-    local_num_experts: int,
-    routing_method_type: int,
-    activation_type: int,
+    layer_name: str,
 ) -> torch.Tensor:
-    del (
-        routing_logits,
-        routing_bias,
-        hidden_states,
-        hidden_states_scale,
-        gemm1_weights,
-        gemm1_weights_scale,
-        gemm2_weights,
-        gemm2_weights_scale,
-        output1_scale_scalar,
-        output1_scale_gate_scalar,
-        output2_scale_scalar,
-        num_experts,
-        top_k,
-        n_group,
-        topk_group,
-        intermediate_size,
-        local_expert_offset,
-        local_num_experts,
-        routing_method_type,
-        activation_type,
-    )
-    return torch.empty_like(output_template)
+    del layer_name
+    return torch.empty_like(hidden_states)
 
 
 direct_register_custom_op(
-    op_name="kimi_k25_nvfp4_trtllm_moe",
-    op_func=_kimi_k25_nvfp4_trtllm_moe,
-    fake_impl=_kimi_k25_nvfp4_trtllm_moe_fake,
+    op_name="kimi_k25_nvfp4_moe",
+    op_func=_kimi_k25_nvfp4_moe,
+    fake_impl=_kimi_k25_nvfp4_moe_fake,
+    dispatch_key=current_platform.dispatch_key,
 )
 
 
@@ -2361,7 +2269,9 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
             raise RuntimeError("Kimi-K2.5 NVFP4 MoE weights were not post-processed.")
 
         original_hidden_dim = hidden_states.shape[-1]
-        output_template = hidden_states
+        output = hidden_states.new_empty(
+            (*hidden_states.shape[:-1], original_hidden_dim)
+        )
         if self.moe_config.hidden_dim != original_hidden_dim:
             hidden_states = F.pad(
                 hidden_states,
@@ -2387,31 +2297,42 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
         if routing_bias is not None:
             routing_bias = routing_bias.to(torch.bfloat16)
 
-        output = torch.ops.vllm.kimi_k25_nvfp4_trtllm_moe(
-            router_logits.to(torch.float32),
-            routing_bias,
-            hidden_states,
-            hidden_states_scale.view(torch.float8_e4m3fn).reshape(
+        import flashinfer
+
+        result = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+            routing_logits=router_logits.to(torch.float32),
+            routing_bias=routing_bias,
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale.view(torch.float8_e4m3fn).reshape(
                 *hidden_states.shape[:-1], -1
             ),
-            self.w13_weight,
-            quant_config.w1_scale.view(torch.float8_e4m3fn),
-            self.w2_weight,
-            quant_config.w2_scale.view(torch.float8_e4m3fn),
-            self.g1_scale_c,
-            quant_config.g1_alphas,
-            quant_config.g2_alphas,
-            output_template,
-            self.global_num_experts,
-            self.top_k,
-            self.num_expert_group,
-            self.topk_group,
-            self.moe_config.intermediate_size_per_partition,
-            self.local_expert_offset,
-            self.local_num_experts,
-            self.routing_method_type,
-            self.activation_type,
-        )
+            gemm1_weights=self.w13_weight,
+            gemm1_weights_scale=quant_config.w1_scale.view(torch.float8_e4m3fn),
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=self.w2_weight,
+            gemm2_weights_scale=quant_config.w2_scale.view(torch.float8_e4m3fn),
+            gemm2_bias=None,
+            output1_scale_scalar=self.g1_scale_c,
+            output1_scale_gate_scalar=quant_config.g1_alphas,
+            output2_scale_scalar=quant_config.g2_alphas,
+            num_experts=self.global_num_experts,
+            top_k=self.top_k,
+            n_group=self.num_expert_group,
+            topk_group=self.topk_group,
+            intermediate_size=self.moe_config.intermediate_size_per_partition,
+            local_expert_offset=self.local_expert_offset,
+            local_num_experts=self.local_num_experts,
+            routed_scaling_factor=1.0,
+            routing_method_type=self.routing_method_type,
+            do_finalize=True,
+            activation_type=self.activation_type,
+            output=output,
+        )[0]
+        if result.data_ptr() != output.data_ptr():
+            output.copy_(result)
         return output[..., :original_hidden_dim]
 
 
@@ -2427,6 +2348,12 @@ class KimiK25Nvfp4MoE(nn.Module):
         prefix: str,
     ) -> None:
         super().__init__()
+        compilation_config = vllm_config.compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+        self.layer_name = prefix
+
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
@@ -2484,14 +2411,17 @@ class KimiK25Nvfp4MoE(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return torch.ops.vllm.kimi_k25_nvfp4_moe(
+            hidden_states,
+            self.layer_name,
+        )
+
+    def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         _, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         shared_overlapped = False
-        if (
-            not torch.compiler.is_compiling()
-            and self.shared_expert_overlap is not None
-        ):
+        if self.shared_expert_overlap is not None:
             shared_overlapped = self.shared_expert_overlap.start(hidden_states)
 
         router_logits, _ = self.gate(hidden_states)
@@ -2499,14 +2429,10 @@ class KimiK25Nvfp4MoE(nn.Module):
 
         shared_output = None
         if self.shared_expert_overlap is not None:
-            if torch.compiler.is_compiling():
-                assert self.shared_experts is not None
-                shared_output = self.shared_experts(hidden_states)
-            else:
-                shared_output = self.shared_expert_overlap.finish(
-                    hidden_states,
-                    shared_overlapped,
-                )
+            shared_output = self.shared_expert_overlap.finish(
+                hidden_states,
+                shared_overlapped,
+            )
 
         if self.routed_scaling_factor != 1.0:
             if routed_output.dtype != torch.float16 or shared_output is None:

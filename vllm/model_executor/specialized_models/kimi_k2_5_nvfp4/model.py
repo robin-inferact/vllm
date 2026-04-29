@@ -2478,12 +2478,12 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
             self.moe_config.intermediate_size_per_partition,
             self.local_expert_offset,
             self.local_num_experts,
-            routed_scaling_factor,
-            self.routing_method_type,
-            do_finalize,
-            None,
-            self.activation_type,
-            output,
+            routed_scaling_factor=routed_scaling_factor,
+            routing_method_type=self.routing_method_type,
+            do_finalize=do_finalize,
+            enable_pdl=True,
+            activation_type=self.activation_type,
+            output=output,
         )
 
     def forward(

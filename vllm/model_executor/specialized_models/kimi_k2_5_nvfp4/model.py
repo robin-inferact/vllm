@@ -102,18 +102,15 @@ _TARGET_MODEL_NAMES = {"nvidia/Kimi-K2.5-NVFP4"}
 logger = init_logger(__name__)
 
 _KIMI_TRTLLM_AR_WORLD_SIZES = {2, 4, 8, 16}
-_KIMI_MOE_FINALIZE_AR_WORLD_SIZES = _KIMI_TRTLLM_AR_WORLD_SIZES
 _kimi_attention_ar_workspace: Any | None = None
 _kimi_attention_ar_workspace_key: tuple[int, int, int, torch.dtype, int] | None = None
 _kimi_attention_ar_workspace_max_tokens = 0
-_kimi_attention_ar_workspace_disabled = False
 _kimi_attention_ar_workspace_lock = threading.Lock()
 _kimi_moe_finalize_ar_workspace: Any | None = None
 _kimi_moe_finalize_ar_workspace_key: tuple[int, int, int, torch.dtype, int] | None = (
     None
 )
 _kimi_moe_finalize_ar_workspace_max_tokens = 0
-_kimi_moe_finalize_ar_workspace_disabled = False
 _kimi_moe_finalize_ar_workspace_lock = threading.Lock()
 
 
@@ -167,21 +164,16 @@ def _get_kimi_attention_ar_workspace(
     hidden_dim: int,
     dtype: torch.dtype,
     group: Any,
-) -> Any | None:
+) -> Any:
     global _kimi_attention_ar_workspace
     global _kimi_attention_ar_workspace_key
     global _kimi_attention_ar_workspace_max_tokens
-    global _kimi_attention_ar_workspace_disabled
 
     if get_node_count() > 1:
-        logger.warning_once(
+        raise RuntimeError(
             "FlashInfer TRTLLM attention all-reduce fusion is not supported "
             "for multi-node tensor-parallel groups."
         )
-        _kimi_attention_ar_workspace_disabled = True
-        return None
-    if _kimi_attention_ar_workspace_disabled:
-        return None
 
     key = (world_size, rank, hidden_dim, dtype, id(group))
     with _kimi_attention_ar_workspace_lock:
@@ -212,12 +204,10 @@ def _get_kimi_attention_ar_workspace(
             group,
         )
         if workspace is None:
-            _kimi_attention_ar_workspace_disabled = True
-            logger.warning_once(
+            raise RuntimeError(
                 "Failed to initialize Kimi-K2.5 attention all-reduce "
-                "workspace; falling back to separate all-reduce and RMSNorm."
+                "workspace."
             )
-            return None
 
         _kimi_attention_ar_workspace = workspace
         _kimi_attention_ar_workspace_key = key
@@ -237,21 +227,16 @@ def _get_kimi_moe_finalize_ar_workspace(
     hidden_dim: int,
     dtype: torch.dtype,
     group: Any,
-) -> Any | None:
+) -> Any:
     global _kimi_moe_finalize_ar_workspace
     global _kimi_moe_finalize_ar_workspace_key
     global _kimi_moe_finalize_ar_workspace_max_tokens
-    global _kimi_moe_finalize_ar_workspace_disabled
 
     if get_node_count() > 1:
-        logger.warning_once(
+        raise RuntimeError(
             "FlashInfer TRTLLM MoE finalize all-reduce fusion is not supported "
             "for multi-node tensor-parallel groups."
         )
-        _kimi_moe_finalize_ar_workspace_disabled = True
-        return None
-    if _kimi_moe_finalize_ar_workspace_disabled:
-        return None
 
     key = (world_size, rank, hidden_dim, dtype, id(group))
     with _kimi_moe_finalize_ar_workspace_lock:
@@ -282,13 +267,10 @@ def _get_kimi_moe_finalize_ar_workspace(
             group,
         )
         if workspace is None:
-            _kimi_moe_finalize_ar_workspace_disabled = True
-            logger.warning_once(
+            raise RuntimeError(
                 "Failed to initialize Kimi-K2.5 MoE finalize all-reduce "
-                "workspace; falling back to separate MoE, all-reduce, and "
-                "RMSNorm."
+                "workspace."
             )
-            return None
 
         _kimi_moe_finalize_ar_workspace = workspace
         _kimi_moe_finalize_ar_workspace_key = key
@@ -324,6 +306,14 @@ def _is_kimi_nvfp4_checkpoint(vllm_config: VllmConfig) -> bool:
     )
 
 
+def _has_flashinfer_comm_kernel(kernel_name: str) -> bool:
+    try:
+        import flashinfer.comm as flashinfer_comm
+    except ImportError:
+        return False
+    return hasattr(flashinfer_comm, kernel_name)
+
+
 def _get_kimi_nvfp4_specialization_rejection_reason(
     vllm_config: VllmConfig,
 ) -> str | None:
@@ -347,6 +337,16 @@ def _get_kimi_nvfp4_specialization_rejection_reason(
     config = vllm_config.model_config.hf_config
     text_config = getattr(config, "text_config", config)
     parallel_config = vllm_config.parallel_config
+    tensor_parallel_size = parallel_config.tensor_parallel_size
+
+    if get_node_count() > 1:
+        return "the specialized Kimi-K2.5 path requires single-node TP"
+    if tensor_parallel_size not in _KIMI_TRTLLM_AR_WORLD_SIZES:
+        return (
+            "the specialized Kimi-K2.5 path requires TP size in "
+            f"{sorted(_KIMI_TRTLLM_AR_WORLD_SIZES)}, got "
+            f"{tensor_parallel_size}"
+        )
 
     if parallel_config.enable_eplb:
         return "the specialized Kimi-K2.5 MoE path does not support EPLB"
@@ -377,6 +377,10 @@ def _get_kimi_nvfp4_specialization_rejection_reason(
         return "the specialized Kimi-K2.5 MoE path requires Blackwell CUDA"
     if not has_flashinfer_trtllm_fused_moe():
         return "FlashInfer TRTLLM fused NVFP4 MoE is unavailable"
+    if not _has_flashinfer_comm_kernel("trtllm_allreduce_fusion"):
+        return "FlashInfer TRTLLM all-reduce fusion is unavailable"
+    if not _has_flashinfer_comm_kernel("trtllm_moe_finalize_allreduce_fusion"):
+        return "FlashInfer TRTLLM MoE finalize all-reduce fusion is unavailable"
     if envs.is_set("VLLM_USE_FLASHINFER_MOE_FP4") and not (
         envs.VLLM_USE_FLASHINFER_MOE_FP4
     ):
@@ -399,9 +403,18 @@ def _get_kimi_nvfp4_specialization_rejection_reason(
         return "the specialized Kimi-K2.5 MoE path requires sigmoid routing"
     if getattr(text_config, "n_group", 1) <= 0:
         return "the specialized Kimi-K2.5 MoE path requires grouped routing"
+    if (
+        vllm_config.model_config.dtype == torch.float16
+        and getattr(text_config, "n_shared_experts", None) is not None
+        and getattr(text_config, "routed_scaling_factor", 1.0) != 1.0
+    ):
+        return (
+            "the specialized Kimi-K2.5 fused MoE tail requires bf16 when "
+            "shared experts and routed scaling are both enabled"
+        )
 
     num_local_heads = (
-        text_config.num_attention_heads // get_tensor_model_parallel_world_size()
+        text_config.num_attention_heads // tensor_parallel_size
     )
     try:
         attn_backend = get_attn_backend(
@@ -2247,29 +2260,6 @@ class _KimiK25SharedExpertOverlap:
         return output
 
 
-def _fallback_attention_allreduce_norm(
-    allreduce_in: torch.Tensor,
-    residual: torch.Tensor,
-    norm_weight: torch.Tensor,
-    norm_eps: float,
-) -> None:
-    allreduce_out = tensor_model_parallel_all_reduce(allreduce_in)
-    result = RMSNorm.forward_static(
-        allreduce_out,
-        norm_eps,
-        int(norm_weight.shape[0]),
-        allreduce_out.dtype,
-        weight=norm_weight,
-        residual=residual,
-    )
-    assert isinstance(result, tuple)
-    norm_out, residual_out = result
-    if norm_out.data_ptr() != allreduce_in.data_ptr():
-        allreduce_in.copy_(norm_out)
-    if residual_out.data_ptr() != residual.data_ptr():
-        residual.copy_(residual_out)
-
-
 def _kimi_k25_nvfp4_attention_allreduce_norm(
     allreduce_in: torch.Tensor,
     residual: torch.Tensor,
@@ -2277,22 +2267,7 @@ def _kimi_k25_nvfp4_attention_allreduce_norm(
     norm_eps: float,
     max_token_num: int,
 ) -> None:
-    try:
-        import flashinfer.comm as flashinfer_comm
-    except ImportError:
-        return _fallback_attention_allreduce_norm(
-            allreduce_in,
-            residual,
-            norm_weight,
-            norm_eps,
-        )
-    if not hasattr(flashinfer_comm, "trtllm_allreduce_fusion"):
-        return _fallback_attention_allreduce_norm(
-            allreduce_in,
-            residual,
-            norm_weight,
-            norm_eps,
-        )
+    import flashinfer.comm as flashinfer_comm
 
     token_num, hidden_dim = allreduce_in.shape
     tp_group = get_tp_group()
@@ -2304,13 +2279,6 @@ def _kimi_k25_nvfp4_attention_allreduce_norm(
         dtype=allreduce_in.dtype,
         group=tp_group.device_group,
     )
-    if workspace is None:
-        return _fallback_attention_allreduce_norm(
-            allreduce_in,
-            residual,
-            norm_weight,
-            norm_eps,
-        )
 
     flashinfer_comm.trtllm_allreduce_fusion(
         allreduce_in=allreduce_in.view(-1),
@@ -2843,53 +2811,12 @@ class KimiK25Nvfp4MoE(nn.Module):
             self.layer_name,
         )
 
-    def _can_use_trtllm_moe_finalize_allreduce_norm(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        norm_layer: RMSNorm,
-    ) -> bool:
-        if _kimi_moe_finalize_ar_workspace_disabled:
-            return False
-        if not current_platform.is_cuda() or not hidden_states.is_cuda:
-            return False
-        if hidden_states.dtype not in (torch.float16, torch.bfloat16):
-            return False
-        if hidden_states.dim() != 2 or residual.dim() != 2:
-            return False
-        if not hidden_states.is_contiguous() or not residual.is_contiguous():
-            return False
-        if norm_layer.variance_size_override is not None:
-            return False
-        if not norm_layer.weight.is_contiguous():
-            return False
-
-        tp_group = get_tp_group()
-        if tp_group.world_size not in _KIMI_MOE_FINALIZE_AR_WORLD_SIZES:
-            return False
-
-        # The existing eager path has a special fp16 shared-expert scaling
-        # ordering. Keep that exact split unless the dtype follows Kimi's bf16
-        # path, where applying the routed scale before finalize is equivalent.
-        return not (
-            hidden_states.dtype == torch.float16
-            and self.shared_expert_overlap is not None
-            and self.routed_scaling_factor != 1.0
-        )
-
     def forward_finalize_allreduce_norm(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         norm_layer: RMSNorm,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        if not self._can_use_trtllm_moe_finalize_allreduce_norm(
-            hidden_states,
-            residual,
-            norm_layer,
-        ):
-            return None
-
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         return torch.ops.vllm.kimi_k25_nvfp4_moe_finalize_allreduce_norm(
             hidden_states,
             residual,
@@ -2898,25 +2825,6 @@ class KimiK25Nvfp4MoE(nn.Module):
             float(norm_layer.variance_epsilon),
         )
 
-    def _fallback_finalize_norm(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        norm_weight: torch.Tensor,
-        norm_eps: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        output = self._forward_impl(hidden_states)
-        result = RMSNorm.forward_static(
-            output,
-            norm_eps,
-            int(norm_weight.shape[0]),
-            output.dtype,
-            weight=norm_weight,
-            residual=residual,
-        )
-        assert isinstance(result, tuple)
-        return result
-
     def _forward_finalize_allreduce_norm_impl(
         self,
         hidden_states: torch.Tensor,
@@ -2924,22 +2832,7 @@ class KimiK25Nvfp4MoE(nn.Module):
         norm_weight: torch.Tensor,
         norm_eps: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        try:
-            import flashinfer.comm as flashinfer_comm
-        except ImportError:
-            return self._fallback_finalize_norm(
-                hidden_states,
-                residual,
-                norm_weight,
-                norm_eps,
-            )
-        if not hasattr(flashinfer_comm, "trtllm_moe_finalize_allreduce_fusion"):
-            return self._fallback_finalize_norm(
-                hidden_states,
-                residual,
-                norm_weight,
-                norm_eps,
-            )
+        import flashinfer.comm as flashinfer_comm
 
         _, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -2977,44 +2870,24 @@ class KimiK25Nvfp4MoE(nn.Module):
             dtype=hidden_states.dtype,
             group=tp_group.device_group,
         )
-        if workspace is None:
-            return self._fallback_finalize_norm(
-                hidden_states,
-                residual,
-                norm_weight,
-                norm_eps,
-            )
 
         norm_out = torch.empty_like(hidden_states)
         residual_out = torch.empty_like(residual)
-        try:
-            flashinfer_comm.trtllm_moe_finalize_allreduce_fusion(
-                allreduce_in=allreduce_in,
-                residual_in=residual,
-                norm_weight=norm_weight,
-                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-                norm_out=norm_out,
-                residual_out=residual_out,
-                workspace_ptrs=workspace.workspace_tensor,
-                launch_with_pdl=True,
-                world_rank=tp_group.rank_in_group,
-                world_size=tp_group.world_size,
-                eps=norm_eps,
-                shared_expert_output=shared_output,
-                expert_scale_factor=expert_weights,
-            )
-        except ValueError as e:
-            logger.warning_once(
-                "FlashInfer TRTLLM MoE finalize all-reduce fusion rejected "
-                "this problem size: %s. Falling back to the unfused tail.",
-                e,
-            )
-            return self._fallback_finalize_norm(
-                hidden_states,
-                residual,
-                norm_weight,
-                norm_eps,
-            )
+        flashinfer_comm.trtllm_moe_finalize_allreduce_fusion(
+            allreduce_in=allreduce_in,
+            residual_in=residual,
+            norm_weight=norm_weight,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            norm_out=norm_out,
+            residual_out=residual_out,
+            workspace_ptrs=workspace.workspace_tensor,
+            launch_with_pdl=True,
+            world_rank=tp_group.rank_in_group,
+            world_size=tp_group.world_size,
+            eps=norm_eps,
+            shared_expert_output=shared_output,
+            expert_scale_factor=expert_weights,
+        )
         return norm_out, residual_out
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -3155,58 +3028,29 @@ class KimiK25Nvfp4DecoderLayer(nn.Module):
             and self.is_moe
             and isinstance(self.mlp, KimiK25Nvfp4MoE)
         ):
-            fused_result = self.mlp.forward_finalize_allreduce_norm(
+            hidden_states, residual = self.mlp.forward_finalize_allreduce_norm(
                 hidden_states,
                 residual,
                 next_input_layernorm,
             )
-            if fused_result is not None:
-                return fused_result[0], fused_result[1], True
+            return hidden_states, residual, True
 
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual, False
-
-    def _can_use_trtllm_attention_allreduce_norm(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-    ) -> bool:
-        if _kimi_attention_ar_workspace_disabled:
-            return False
-        if get_tensor_model_parallel_world_size() == 1:
-            return False
-        if not current_platform.is_cuda() or not hidden_states.is_cuda:
-            return False
-        if hidden_states.dtype not in (torch.float16, torch.bfloat16):
-            return False
-        if hidden_states.dim() != 2 or residual.dim() != 2:
-            return False
-        if not hidden_states.is_contiguous() or not residual.is_contiguous():
-            return False
-        if self.post_attention_layernorm.variance_size_override is not None:
-            return False
-        if not self.post_attention_layernorm.weight.is_contiguous():
-            return False
-        return get_tp_group().world_size in _KIMI_TRTLLM_AR_WORLD_SIZES
 
     def _post_attention_allreduce_norm(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._can_use_trtllm_attention_allreduce_norm(hidden_states, residual):
-            torch.ops.vllm.kimi_k25_nvfp4_attention_allreduce_norm(
-                hidden_states,
-                residual,
-                self.post_attention_layernorm.weight,
-                float(self.post_attention_layernorm.variance_epsilon),
-                int(self.max_num_batched_tokens),
-            )
-            return hidden_states, residual
-
-        if get_tensor_model_parallel_world_size() > 1:
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        return self.post_attention_layernorm(hidden_states, residual)
+        torch.ops.vllm.kimi_k25_nvfp4_attention_allreduce_norm(
+            hidden_states,
+            residual,
+            self.post_attention_layernorm.weight,
+            float(self.post_attention_layernorm.variance_epsilon),
+            int(self.max_num_batched_tokens),
+        )
+        return hidden_states, residual
 
     def fuse_shared_expert_act_quant(self) -> None:
         if not self.is_moe:

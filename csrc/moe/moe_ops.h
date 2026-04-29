@@ -62,6 +62,14 @@ void shuffle_rows(const torch::Tensor& input_tensor,
 torch::Tensor router_gemm_bf16_fp32(torch::Tensor const& input,
                                     torch::Tensor const& weight);
 
+// Kimi-K2.5 BF16 router GEMM through cuBLASLt NVJET.
+// Computes output = input @ weight.T where:
+//   input: [num_tokens, 7168] in bf16
+//   weight: [384, 7168] in bf16
+//   output: [num_tokens, 384] in fp32
+torch::Tensor kimi_k25_router_gemm_bf16_fp32_cublaslt(
+    torch::Tensor const& input, torch::Tensor const& weight);
+
 // DeepSeek V3 optimized router GEMM kernel for SM90+
 // Computes output = mat_a @ mat_b.T where:
 //   mat_a: [num_tokens, hidden_dim] in bf16

@@ -2805,6 +2805,12 @@ class KimiK25Nvfp4MoE(nn.Module):
             self.physical_expert_start + self.n_local_physical_experts
         )
 
+    def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return ops.kimi_k25_router_gemm_bf16_fp32_cublaslt(
+            hidden_states,
+            self.gate.weight,
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return torch.ops.vllm.kimi_k25_nvfp4_moe(
             hidden_states,
@@ -2842,7 +2848,7 @@ class KimiK25Nvfp4MoE(nn.Module):
         if self.shared_expert_overlap is not None:
             shared_overlapped = self.shared_expert_overlap.start(hidden_states)
 
-        router_logits, _ = self.gate(hidden_states)
+        router_logits = self._router_logits(hidden_states)
         (
             allreduce_in,
             expert_weights,
@@ -2898,7 +2904,7 @@ class KimiK25Nvfp4MoE(nn.Module):
         if self.shared_expert_overlap is not None:
             shared_overlapped = self.shared_expert_overlap.start(hidden_states)
 
-        router_logits, _ = self.gate(hidden_states)
+        router_logits = self._router_logits(hidden_states)
         routed_output = self.experts(hidden_states, router_logits)
 
         shared_output = None

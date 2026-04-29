@@ -2452,6 +2452,34 @@ if hasattr(torch.ops, "_moe_C") and hasattr(torch.ops._moe_C, "router_gemm_bf16_
         )
 
 
+def kimi_k25_router_gemm_bf16_fp32_cublaslt(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Kimi-K2.5 bf16 router GEMM via cuBLASLt NVJET.
+
+    Computes input @ weight.T with fp32 output. weight shape: (384, 7168).
+    """
+    return torch.ops._moe_C.kimi_k25_router_gemm_bf16_fp32_cublaslt(
+        input,
+        weight,
+    )
+
+
+if hasattr(torch.ops, "_moe_C") and hasattr(
+    torch.ops._moe_C, "kimi_k25_router_gemm_bf16_fp32_cublaslt"
+):
+
+    @register_fake("_moe_C::kimi_k25_router_gemm_bf16_fp32_cublaslt")
+    def kimi_k25_router_gemm_bf16_fp32_cublaslt_fake(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty(
+            input.shape[0], weight.shape[0], dtype=torch.float32, device=input.device
+        )
+
+
 def dsv3_router_gemm(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,

@@ -129,6 +129,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.def("router_gemm_bf16_fp32(Tensor input, Tensor weight) -> Tensor");
   m.impl("router_gemm_bf16_fp32", torch::kCUDA, &router_gemm_bf16_fp32);
 
+  // Kimi-K2.5 cuBLASLt/NVJET bf16 x bf16 -> fp32 router GEMM.
+  m.def(
+      "kimi_k25_router_gemm_bf16_fp32_cublaslt(Tensor input, Tensor weight) "
+      "-> Tensor");
+  m.impl("kimi_k25_router_gemm_bf16_fp32_cublaslt", torch::kCUDA,
+         &kimi_k25_router_gemm_bf16_fp32_cublaslt);
+
   // DeepSeek V3 optimized router GEMM for SM90+
   m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
   // conditionally compiled so impl registration is in source file

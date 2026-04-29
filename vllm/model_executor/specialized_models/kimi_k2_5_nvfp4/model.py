@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Text-only specialized Kimi-K2.5 NVFP4 implementation."""
 
+import atexit
+import threading
 from collections.abc import Iterable
 from typing import Any
 
@@ -22,10 +24,15 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_dp_group,
+    get_node_count,
     get_pcp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
+)
+from vllm.distributed.device_communicators.flashinfer_all_reduce import (
+    _create_workspace as _create_flashinfer_allreduce_workspace,
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -93,6 +100,108 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 _TARGET_MODEL_NAMES = {"nvidia/Kimi-K2.5-NVFP4"}
 logger = init_logger(__name__)
+
+_KIMI_MOE_FINALIZE_AR_WORLD_SIZES = {2, 4, 8, 16}
+_kimi_moe_finalize_ar_workspace: Any | None = None
+_kimi_moe_finalize_ar_workspace_key: tuple[int, int, int, torch.dtype, int] | None = (
+    None
+)
+_kimi_moe_finalize_ar_workspace_max_tokens = 0
+_kimi_moe_finalize_ar_workspace_disabled = False
+_kimi_moe_finalize_ar_workspace_lock = threading.Lock()
+
+
+def _destroy_kimi_moe_finalize_ar_workspace() -> None:
+    global _kimi_moe_finalize_ar_workspace
+    global _kimi_moe_finalize_ar_workspace_key
+    global _kimi_moe_finalize_ar_workspace_max_tokens
+
+    workspace = _kimi_moe_finalize_ar_workspace
+    _kimi_moe_finalize_ar_workspace = None
+    _kimi_moe_finalize_ar_workspace_key = None
+    _kimi_moe_finalize_ar_workspace_max_tokens = 0
+    if workspace is not None:
+        try:
+            workspace.destroy()
+        except Exception:
+            logger.debug(
+                "Failed to destroy Kimi-K2.5 MoE finalize all-reduce workspace.",
+                exc_info=True,
+            )
+
+
+atexit.register(_destroy_kimi_moe_finalize_ar_workspace)
+
+
+def _get_kimi_moe_finalize_ar_workspace(
+    *,
+    world_size: int,
+    rank: int,
+    max_token_num: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    group: Any,
+) -> Any | None:
+    global _kimi_moe_finalize_ar_workspace
+    global _kimi_moe_finalize_ar_workspace_key
+    global _kimi_moe_finalize_ar_workspace_max_tokens
+    global _kimi_moe_finalize_ar_workspace_disabled
+
+    if get_node_count() > 1:
+        logger.warning_once(
+            "FlashInfer TRTLLM MoE finalize all-reduce fusion is not supported "
+            "for multi-node tensor-parallel groups."
+        )
+        _kimi_moe_finalize_ar_workspace_disabled = True
+        return None
+    if _kimi_moe_finalize_ar_workspace_disabled:
+        return None
+
+    key = (world_size, rank, hidden_dim, dtype, id(group))
+    with _kimi_moe_finalize_ar_workspace_lock:
+        workspace = _kimi_moe_finalize_ar_workspace
+        if (
+            workspace is not None
+            and _kimi_moe_finalize_ar_workspace_key == key
+            and _kimi_moe_finalize_ar_workspace_max_tokens >= max_token_num
+            and workspace.is_buffer_size_sufficient(
+                world_size,
+                max_token_num,
+                hidden_dim,
+                dtype,
+            )
+        ):
+            return workspace
+
+        if workspace is not None and current_platform.is_cuda():
+            torch.cuda.synchronize()
+        _destroy_kimi_moe_finalize_ar_workspace()
+        workspace = _create_flashinfer_allreduce_workspace(
+            "trtllm",
+            world_size,
+            rank,
+            max_token_num,
+            hidden_dim,
+            dtype,
+            group,
+        )
+        if workspace is None:
+            _kimi_moe_finalize_ar_workspace_disabled = True
+            logger.warning_once(
+                "Failed to initialize Kimi-K2.5 MoE finalize all-reduce "
+                "workspace; falling back to separate MoE, all-reduce, and "
+                "RMSNorm."
+            )
+            return None
+
+        _kimi_moe_finalize_ar_workspace = workspace
+        _kimi_moe_finalize_ar_workspace_key = key
+        _kimi_moe_finalize_ar_workspace_max_tokens = max_token_num
+        logger.info_once(
+            "Initialized Kimi-K2.5 MoE finalize all-reduce workspace "
+            "with backend=trtllm."
+        )
+        return workspace
 
 
 def _is_kimi_nvfp4_checkpoint(vllm_config: VllmConfig) -> bool:
@@ -2061,6 +2170,41 @@ direct_register_custom_op(
 )
 
 
+def _kimi_k25_nvfp4_moe_finalize_allreduce_norm(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    layer_name: str,
+    norm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    return layer._forward_finalize_allreduce_norm_impl(
+        hidden_states,
+        residual,
+        norm_weight,
+        norm_eps,
+    )
+
+
+def _kimi_k25_nvfp4_moe_finalize_allreduce_norm_fake(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    layer_name: str,
+    norm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del norm_weight, layer_name, norm_eps
+    return torch.empty_like(hidden_states), torch.empty_like(residual)
+
+
+direct_register_custom_op(
+    op_name="kimi_k25_nvfp4_moe_finalize_allreduce_norm",
+    op_func=_kimi_k25_nvfp4_moe_finalize_allreduce_norm,
+    fake_impl=_kimi_k25_nvfp4_moe_finalize_allreduce_norm_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
+
+
 class KimiK25Nvfp4RoutedExperts(nn.Module):
     """Kimi-K2.5 routed experts for the FlashInfer TRTLLM NVFP4 path."""
 
@@ -2259,19 +2403,25 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
         self.moe_config.num_local_experts = self.local_num_experts
         return None
 
-    def forward(
+    def _run_flashinfer_trtllm_moe(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
-    ) -> torch.Tensor:
+        *,
+        routed_scaling_factor: float,
+        do_finalize: bool,
+        output: torch.Tensor | None,
+    ) -> list[torch.Tensor]:
         quant_config = self.quant_method.moe_quant_config
         if quant_config is None:
             raise RuntimeError("Kimi-K2.5 NVFP4 MoE weights were not post-processed.")
 
         original_hidden_dim = hidden_states.shape[-1]
-        output = hidden_states.new_empty(
-            (*hidden_states.shape[:-1], original_hidden_dim)
-        )
+        if not do_finalize and self.moe_config.hidden_dim != original_hidden_dim:
+            raise RuntimeError(
+                "Kimi-K2.5 MoE finalize all-reduce fusion requires an "
+                "unpadded routed-expert hidden dimension."
+            )
         if self.moe_config.hidden_dim != original_hidden_dim:
             hidden_states = F.pad(
                 hidden_states,
@@ -2299,7 +2449,7 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
 
         import flashinfer
 
-        result = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+        return flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
             routing_logits=router_logits.to(torch.float32),
             routing_bias=routing_bias,
             hidden_states=hidden_states,
@@ -2325,15 +2475,65 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
             intermediate_size=self.moe_config.intermediate_size_per_partition,
             local_expert_offset=self.local_expert_offset,
             local_num_experts=self.local_num_experts,
-            routed_scaling_factor=1.0,
+            routed_scaling_factor=routed_scaling_factor,
             routing_method_type=self.routing_method_type,
-            do_finalize=True,
+            do_finalize=do_finalize,
             activation_type=self.activation_type,
+            output=output,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        original_hidden_dim = hidden_states.shape[-1]
+        output = hidden_states.new_empty(
+            (*hidden_states.shape[:-1], original_hidden_dim)
+        )
+        result = self._run_flashinfer_trtllm_moe(
+            hidden_states,
+            router_logits,
+            routed_scaling_factor=1.0,
+            do_finalize=True,
             output=output,
         )[0]
         if result.data_ptr() != output.data_ptr():
             output.copy_(result)
         return output[..., :original_hidden_dim]
+
+    def forward_unfinalized(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        routed_scaling_factor: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        result = self._run_flashinfer_trtllm_moe(
+            hidden_states,
+            router_logits,
+            routed_scaling_factor=routed_scaling_factor,
+            do_finalize=False,
+            output=None,
+        )
+        if len(result) != 3:
+            raise RuntimeError(
+                "FlashInfer TRTLLM NVFP4 MoE returned an unexpected result "
+                f"for do_finalize=False: {len(result)} tensors."
+            )
+        expanded_idx_to_permuted_idx = result[2]
+        if expanded_idx_to_permuted_idx.dim() == 1:
+            expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.view(
+                -1,
+                self.top_k,
+            )
+        elif expanded_idx_to_permuted_idx.shape[-1] != self.top_k:
+            raise RuntimeError(
+                "FlashInfer TRTLLM NVFP4 MoE returned an unexpected "
+                "expanded-index shape for do_finalize=False: "
+                f"{tuple(expanded_idx_to_permuted_idx.shape)}."
+            )
+        return result[0], result[1], expanded_idx_to_permuted_idx
 
 
 class KimiK25Nvfp4MoE(nn.Module):
@@ -2415,6 +2615,184 @@ class KimiK25Nvfp4MoE(nn.Module):
             hidden_states,
             self.layer_name,
         )
+
+    def _can_use_trtllm_moe_finalize_allreduce_norm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        norm_layer: RMSNorm,
+    ) -> bool:
+        if _kimi_moe_finalize_ar_workspace_disabled:
+            return False
+        if not current_platform.is_cuda() or not hidden_states.is_cuda:
+            return False
+        if hidden_states.dtype not in (torch.float16, torch.bfloat16):
+            return False
+        if hidden_states.dim() != 2 or residual.dim() != 2:
+            return False
+        if not hidden_states.is_contiguous() or not residual.is_contiguous():
+            return False
+        if norm_layer.variance_size_override is not None:
+            return False
+        if not norm_layer.weight.is_contiguous():
+            return False
+
+        tp_group = get_tp_group()
+        if tp_group.world_size not in _KIMI_MOE_FINALIZE_AR_WORLD_SIZES:
+            return False
+
+        # The existing eager path has a special fp16 shared-expert scaling
+        # ordering. Keep that exact split unless the dtype follows Kimi's bf16
+        # path, where applying the routed scale before finalize is equivalent.
+        return not (
+            hidden_states.dtype == torch.float16
+            and self.shared_expert_overlap is not None
+            and self.routed_scaling_factor != 1.0
+        )
+
+    def forward_finalize_allreduce_norm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        norm_layer: RMSNorm,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if not self._can_use_trtllm_moe_finalize_allreduce_norm(
+            hidden_states,
+            residual,
+            norm_layer,
+        ):
+            return None
+
+        return torch.ops.vllm.kimi_k25_nvfp4_moe_finalize_allreduce_norm(
+            hidden_states,
+            residual,
+            norm_layer.weight,
+            self.layer_name,
+            float(norm_layer.variance_epsilon),
+        )
+
+    def _fallback_finalize_norm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        output = self._forward_impl(hidden_states)
+        result = RMSNorm.forward_static(
+            output,
+            norm_eps,
+            int(norm_weight.shape[0]),
+            output.dtype,
+            weight=norm_weight,
+            residual=residual,
+        )
+        assert isinstance(result, tuple)
+        return result
+
+    def _forward_finalize_allreduce_norm_impl(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        try:
+            import flashinfer.comm as flashinfer_comm
+        except ImportError:
+            return self._fallback_finalize_norm(
+                hidden_states,
+                residual,
+                norm_weight,
+                norm_eps,
+            )
+        if not hasattr(flashinfer_comm, "trtllm_moe_finalize_allreduce_fusion"):
+            return self._fallback_finalize_norm(
+                hidden_states,
+                residual,
+                norm_weight,
+                norm_eps,
+            )
+
+        _, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        residual = residual.view(-1, hidden_dim)
+
+        shared_overlapped = False
+        if self.shared_expert_overlap is not None:
+            shared_overlapped = self.shared_expert_overlap.start(hidden_states)
+
+        router_logits, _ = self.gate(hidden_states)
+        (
+            allreduce_in,
+            expert_weights,
+            expanded_idx_to_permuted_idx,
+        ) = self.experts.forward_unfinalized(
+            hidden_states,
+            router_logits,
+            routed_scaling_factor=1.0,
+        )
+        if self.routed_scaling_factor != 1.0:
+            expert_weights = expert_weights * self.routed_scaling_factor
+        if expert_weights.dtype != hidden_states.dtype:
+            expert_weights = expert_weights.to(hidden_states.dtype)
+
+        shared_output = None
+        if self.shared_expert_overlap is not None:
+            shared_output = self.shared_expert_overlap.finish(
+                hidden_states,
+                shared_overlapped,
+            )
+
+        tp_group = get_tp_group()
+        workspace_token_num = max(1, int(allreduce_in.numel() // hidden_dim))
+        workspace = _get_kimi_moe_finalize_ar_workspace(
+            world_size=tp_group.world_size,
+            rank=tp_group.rank_in_group,
+            max_token_num=workspace_token_num,
+            hidden_dim=hidden_dim,
+            dtype=hidden_states.dtype,
+            group=tp_group.device_group,
+        )
+        if workspace is None:
+            return self._fallback_finalize_norm(
+                hidden_states,
+                residual,
+                norm_weight,
+                norm_eps,
+            )
+
+        norm_out = torch.empty_like(hidden_states)
+        residual_out = torch.empty_like(residual)
+        try:
+            flashinfer_comm.trtllm_moe_finalize_allreduce_fusion(
+                allreduce_in=allreduce_in,
+                residual_in=residual,
+                norm_weight=norm_weight,
+                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                norm_out=norm_out,
+                residual_out=residual_out,
+                workspace_ptrs=workspace.workspace_tensor,
+                launch_with_pdl=True,
+                world_rank=tp_group.rank_in_group,
+                world_size=tp_group.world_size,
+                eps=norm_eps,
+                shared_expert_output=shared_output,
+                expert_scale_factor=expert_weights,
+            )
+        except ValueError as e:
+            logger.warning_once(
+                "FlashInfer TRTLLM MoE finalize all-reduce fusion rejected "
+                "this problem size: %s. Falling back to the unfused tail.",
+                e,
+            )
+            return self._fallback_finalize_norm(
+                hidden_states,
+                residual,
+                norm_weight,
+                norm_eps,
+            )
+        return norm_out, residual_out
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         _, hidden_dim = hidden_states.shape
@@ -2512,17 +2890,51 @@ class KimiK25Nvfp4DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
+        hidden_states, residual, _ = self.forward_with_optional_fused_moe_tail(
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            skip_input_layernorm=False,
+            next_input_layernorm=None,
+        )
+        return hidden_states, residual
+
+    def forward_with_optional_fused_moe_tail(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        *,
+        skip_input_layernorm: bool,
+        next_input_layernorm: RMSNorm | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        if skip_input_layernorm:
+            assert residual is not None
+        elif residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        assert residual is not None
         hidden_states = self.self_attn(positions, hidden_states)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if (
+            next_input_layernorm is not None
+            and self.is_moe
+            and isinstance(self.mlp, KimiK25Nvfp4MoE)
+        ):
+            fused_result = self.mlp.forward_finalize_allreduce_norm(
+                hidden_states,
+                residual,
+                next_input_layernorm,
+            )
+            if fused_result is not None:
+                return fused_result[0], fused_result[1], True
+
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        return hidden_states, residual, False
 
     def fuse_shared_expert_act_quant(self) -> None:
         if not self.is_moe:
@@ -2627,16 +3039,33 @@ class KimiK25Nvfp4TextModel(nn.Module):
 
         residual = None
         aux_hidden_states = []
+        input_layernorm_done = False
         for idx, layer in enumerate(self.layers):
             if idx in self.aux_hidden_state_layers:
-                aux_hidden_states.append(hidden_states + residual)
-            hidden_states, residual = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                residual=residual,
+                if residual is None:
+                    aux_hidden_states.append(hidden_states)
+                else:
+                    aux_hidden_states.append(hidden_states + residual)
+
+            next_input_layernorm = None
+            if not self.aux_hidden_state_layers:
+                if idx + 1 < len(self.layers):
+                    next_input_layernorm = self.layers[idx + 1].input_layernorm
+                else:
+                    next_input_layernorm = self.norm
+
+            hidden_states, residual, input_layernorm_done = (
+                layer.forward_with_optional_fused_moe_tail(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    skip_input_layernorm=input_layernorm_done,
+                    next_input_layernorm=next_input_layernorm,
+                )
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if not input_layernorm_done:
+            hidden_states, _ = self.norm(hidden_states, residual)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states

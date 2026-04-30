@@ -3075,6 +3075,8 @@ class KimiK25Nvfp4MoE(nn.Module):
             expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
             norm_out=norm_out,
             residual_out=residual_out,
+            quant_out=None,
+            scale_out=None,
             workspace_ptrs=workspace.workspace_tensor,
             launch_with_pdl=True,
             world_rank=tp_group.rank_in_group,
@@ -3082,6 +3084,8 @@ class KimiK25Nvfp4MoE(nn.Module):
             eps=norm_eps,
             shared_expert_output=shared_output,
             expert_scale_factor=expert_weights,
+            # Routed scaling is folded into expert_weights by forward_unfinalized.
+            routed_scaling_factor=None,
         )
         return norm_out, residual_out
 

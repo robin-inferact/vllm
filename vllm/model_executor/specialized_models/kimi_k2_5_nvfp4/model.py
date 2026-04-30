@@ -2237,6 +2237,16 @@ class _KimiK25SharedExpertOverlap:
             if envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM
             else aux_stream()
         )
+        self.start_events = (
+            [torch.cuda.Event(), torch.cuda.Event()]
+            if self.stream is not None
+            else []
+        )
+        self.done_events = (
+            [torch.cuda.Event(), torch.cuda.Event()]
+            if self.stream is not None
+            else []
+        )
 
     @property
     def output_idx(self) -> int:
@@ -2258,9 +2268,9 @@ class _KimiK25SharedExpertOverlap:
         idx = self.output_idx
         assert self.outputs[idx] is None
         hidden_states.record_stream(self.stream)
-        self.stream.wait_stream(current_stream())
-        with torch.cuda.stream(self.stream):
-            self.outputs[idx] = self.layer(hidden_states)
+        # Match TRT-LLM capture order: mark the dependency point now,
+        # but enqueue shared-expert work after routed MoE is emitted.
+        current_stream().record_event(self.start_events[idx])
         return True
 
     def finish(self, hidden_states: torch.Tensor, overlapped: bool) -> torch.Tensor:
@@ -2268,8 +2278,13 @@ class _KimiK25SharedExpertOverlap:
             return self.layer(hidden_states)
 
         assert self.stream is not None
-        current_stream().wait_stream(self.stream)
         idx = self.output_idx
+        with torch.cuda.stream(self.stream):
+            self.stream.wait_event(self.start_events[idx])
+            self.outputs[idx] = self.layer(hidden_states)
+            self.stream.record_event(self.done_events[idx])
+        current_stream().wait_event(self.done_events[idx])
+
         output = self.outputs[idx]
         assert output is not None
         self.outputs[idx] = None

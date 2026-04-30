@@ -3,6 +3,7 @@
 """Text-only specialized Kimi-K2.5 NVFP4 implementation."""
 
 import atexit
+import os
 import threading
 from collections.abc import Iterable
 from typing import Any
@@ -113,6 +114,20 @@ _kimi_moe_finalize_ar_workspace_key: tuple[int, int, int, torch.dtype, int] | No
 )
 _kimi_moe_finalize_ar_workspace_max_tokens = 0
 _kimi_moe_finalize_ar_workspace_lock = threading.Lock()
+_kimi_moe_setup_log_lock = threading.Lock()
+_kimi_moe_setup_log_keys: set[tuple[int, int, int, int, int, int, bool]] = set()
+_kimi_moe_runtime_log_lock = threading.Lock()
+_kimi_moe_runtime_log_keys: set[tuple[int, int, int, int, bool]] = set()
+
+
+def _kimi_tensor_meta(tensor: torch.Tensor | None) -> str:
+    if tensor is None:
+        return "None"
+    return (
+        f"shape={tuple(tensor.shape)}, stride={tuple(tensor.stride())}, "
+        f"dtype={tensor.dtype}, device={tensor.device}, "
+        f"contiguous={tensor.is_contiguous()}"
+    )
 
 
 def _destroy_kimi_attention_ar_workspace() -> None:
@@ -2436,6 +2451,12 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
         self.expert_placement_strategy = (
             vllm_config.parallel_config.expert_placement_strategy
         )
+        self.enable_expert_parallel = (
+            vllm_config.parallel_config.enable_expert_parallel
+        )
+        self.enable_flashinfer_autotune = (
+            vllm_config.kernel_config.enable_flashinfer_autotune
+        )
         self.top_k = config.num_experts_per_tok
         self.num_expert_group = getattr(config, "n_group", 1)
         self.topk_group = getattr(config, "topk_group", 1)
@@ -2551,6 +2572,144 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
             weight_loader=self.weight_loader,
             global_num_experts=self.global_num_experts,
         )
+        self._log_expert_setup_once(config, intermediate_size_per_partition)
+
+    def _flashinfer_tactic_hint(self) -> str:
+        if self.enable_flashinfer_autotune:
+            return "autotune/cache"
+        if os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1":
+            return "file-cache-or-fallback"
+        return "fallback[-1,-1]"
+
+    def _log_expert_setup_once(
+        self,
+        config,
+        intermediate_size_per_partition: int,
+    ) -> None:
+        key = (
+            self.tp_rank,
+            self.tp_size,
+            self.ep_rank,
+            self.ep_size,
+            self.local_num_experts,
+            self.local_expert_offset,
+            self.moe_parallel_config.use_ep,
+        )
+        with _kimi_moe_setup_log_lock:
+            if key in _kimi_moe_setup_log_keys:
+                return
+            _kimi_moe_setup_log_keys.add(key)
+
+        expert_map = (
+            "dense/all"
+            if self._expert_map is None
+            else get_compressed_expert_map(self._expert_map)
+        )
+        logger.info(
+            "Kimi-K2.5 NVFP4 MoE expert setup: layer=%s, "
+            "model_tp_rank=%s/%s, moe_tp_rank=%s/%s, ep_rank=%s/%s, "
+            "dp_rank=%s/%s, pcp_rank=%s/%s, use_ep=%s, "
+            "enable_expert_parallel=%s, placement=%s, global_experts=%s, "
+            "logical_experts=%s, local_experts=%s, local_expert_offset=%s, "
+            "flashinfer_local_num_experts_arg=%s, top_k=%s, "
+            "n_group=%s, topk_group=%s, "
+            "hidden_size=%s, moe_intermediate_size=%s, "
+            "intermediate_size_per_partition=%s, use_all2all=%s, eplb=%s, "
+            "enable_flashinfer_autotune=%s, "
+            "FLASHINFER_AUTOTUNER_LOAD_FROM_FILE=%s, "
+            "flashinfer_tactic_hint=%s, expert_map=%s",
+            self.layer_name,
+            get_tensor_model_parallel_rank(),
+            get_tensor_model_parallel_world_size(),
+            self.tp_rank,
+            self.tp_size,
+            self.ep_rank,
+            self.ep_size,
+            self.moe_parallel_config.dp_rank,
+            self.moe_parallel_config.dp_size,
+            self.moe_parallel_config.pcp_rank,
+            self.moe_parallel_config.pcp_size,
+            self.moe_parallel_config.use_ep,
+            self.enable_expert_parallel,
+            self.expert_placement_strategy,
+            self.global_num_experts,
+            self.logical_num_experts,
+            self.local_num_experts,
+            self.local_expert_offset,
+            self.local_num_experts,
+            self.top_k,
+            self.num_expert_group,
+            self.topk_group,
+            config.hidden_size,
+            config.moe_intermediate_size,
+            intermediate_size_per_partition,
+            self.moe_parallel_config.use_all2all_kernels,
+            self.moe_parallel_config.enable_eplb,
+            self.enable_flashinfer_autotune,
+            os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0"),
+            self._flashinfer_tactic_hint(),
+            expert_map,
+        )
+
+    def _log_flashinfer_call_once(
+        self,
+        *,
+        do_finalize: bool,
+        original_hidden_states: torch.Tensor,
+        quantized_hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor,
+        router_logits: torch.Tensor,
+        expert_weights: torch.Tensor | None,
+        output: torch.Tensor | None,
+        routed_scaling_factor: float,
+    ) -> None:
+        key = (
+            self.tp_rank,
+            self.ep_rank,
+            int(original_hidden_states.shape[0]),
+            self.local_num_experts,
+            do_finalize,
+        )
+        with _kimi_moe_runtime_log_lock:
+            if key in _kimi_moe_runtime_log_keys:
+                return
+            _kimi_moe_runtime_log_keys.add(key)
+
+        logger.info(
+            "Kimi-K2.5 NVFP4 FlashInfer MoE call: layer=%s, "
+            "do_finalize=%s, tokens=%s, top_k=%s, global_experts=%s, "
+            "local_experts=%s, local_expert_offset=%s, "
+            "flashinfer_local_num_experts_arg=%s, "
+            "intermediate_size_per_partition=%s, routed_scaling_factor=%s, "
+            "enable_pdl=%s, enable_flashinfer_autotune=%s, "
+            "FLASHINFER_AUTOTUNER_LOAD_FROM_FILE=%s, "
+            "flashinfer_tactic_hint=%s, "
+            "input=(%s), quantized_input=(%s), input_scale=(%s), "
+            "router_logits=(%s), expert_weights=(%s), output=(%s), "
+            "w13=(%s), w2=(%s)",
+            self.layer_name,
+            do_finalize,
+            original_hidden_states.shape[0],
+            self.top_k,
+            self.global_num_experts,
+            self.local_num_experts,
+            self.local_expert_offset,
+            self.local_num_experts,
+            self.moe_config.intermediate_size_per_partition,
+            routed_scaling_factor,
+            True,
+            self.enable_flashinfer_autotune,
+            os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0"),
+            self._flashinfer_tactic_hint(),
+            _kimi_tensor_meta(original_hidden_states),
+            _kimi_tensor_meta(quantized_hidden_states),
+            _kimi_tensor_meta(hidden_states_scale),
+            _kimi_tensor_meta(router_logits),
+            _kimi_tensor_meta(expert_weights),
+            _kimi_tensor_meta(output),
+            _kimi_tensor_meta(self.w13_weight),
+            _kimi_tensor_meta(self.w2_weight),
+        )
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
         if self._expert_map is None:
@@ -2600,6 +2759,7 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
             raise RuntimeError("Kimi-K2.5 NVFP4 MoE weights were not post-processed.")
 
         original_hidden_dim = hidden_states.shape[-1]
+        original_hidden_states = hidden_states
         if not do_finalize and self.moe_config.hidden_dim != original_hidden_dim:
             raise RuntimeError(
                 "Kimi-K2.5 MoE finalize all-reduce fusion requires an "
@@ -2630,6 +2790,20 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
         assert hasattr(self, "g1_scale_c")
 
         routing_bias = self.e_score_correction_bias
+        hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
+            *hidden_states.shape[:-1],
+            -1,
+        )
+        self._log_flashinfer_call_once(
+            do_finalize=do_finalize,
+            original_hidden_states=original_hidden_states,
+            quantized_hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            router_logits=router_logits,
+            expert_weights=expert_weights,
+            output=output,
+            routed_scaling_factor=routed_scaling_factor,
+        )
 
         from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
 
@@ -2639,9 +2813,7 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
             expert_weights,
             routing_bias,
             hidden_states,
-            hidden_states_scale.view(torch.float8_e4m3fn).reshape(
-                *hidden_states.shape[:-1], -1
-            ),
+            hidden_states_scale,
             self.w13_weight,
             quant_config.w1_scale.view(torch.float8_e4m3fn),
             None,
@@ -3097,7 +3269,7 @@ class KimiK25Nvfp4DecoderLayer(nn.Module):
                 down_proj.weight_scale,
                 down_proj.alpha,
                 gate_up.dtype,
-                backend="cutlass",
+                backend="cute-dsl",
             )
 
         shared_experts.forward = _fused_forward  # type: ignore[method-assign]
@@ -3217,9 +3389,8 @@ class KimiK25Nvfp4TextForCausalLM(DeepseekV2ForCausalLM):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loaded = super().load_weights(weights)
-        # TODO: re-enable after fixing inference correctness
-        # for layer in self.model.layers:
-        #     layer.fuse_shared_expert_act_quant()
+        for layer in self.model.layers:
+            layer.fuse_shared_expert_act_quant()
         return loaded
 
 

@@ -73,9 +73,6 @@ int32_t next_power_of_2(int32_t value) {
 
 std::array<int, 8> kimi_k25_nvjet_algo_attrs(int32_t num_tokens) {
   int32_t const mp2 = std::max(next_power_of_2(num_tokens), 8);
-  if (num_tokens < 8) {
-    return {66, 12, 35, 1, 0, 0, 0, 4};
-  }
   if (mp2 <= 16) {
     // Selects nvjet_sm100_tss_32x64_64x16_4x1_v_bz_splitK_TNN.
     return {66, 12, 35, 2, 2, 0, 0, 4};

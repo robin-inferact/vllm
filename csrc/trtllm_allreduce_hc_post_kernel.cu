@@ -803,3 +803,454 @@ void trtllm_ar_hc_post(torch::Tensor const& allreduce_in,
 
   vllm::trtllm_ar_hc_post::run(params, launch_with_pdl, use_oneshot);
 }
+
+namespace vllm {
+namespace mnnvl_ar_hc_post {
+
+static constexpr int kBytesPerAccess = 16;
+static constexpr int kVecSize = kBytesPerAccess / sizeof(__nv_bfloat16);
+static constexpr uint32_t kFp32NegZero = 0x80000000U;
+
+struct Params {
+  int nranks{};
+  int rank{};
+  int num_tokens{};
+  int hidden_dim{};
+  int hc_mult{};
+  void** buffer_ptrs_dev{};
+  void* multicast_ptr{};
+  uint32_t* buffer_flags{};
+  void const* allreduce_in{};
+  void const* residual{};
+  void const* post{};
+  void const* comb{};
+  void* out{};
+  cudaStream_t stream{};
+};
+
+static __host__ __device__ __forceinline__ uint32_t ceil_div_u32(
+    uint32_t a, uint32_t b) {
+  return (a + b - 1) / b;
+}
+
+__device__ __forceinline__ bool is_bf16_neg_zero(__nv_bfloat16 v) {
+  return __bfloat16_as_ushort(v) == 0x8000;
+}
+
+struct alignas(16) BF16Vec8 {
+  __nv_bfloat16 data[kVecSize];
+
+  __device__ __forceinline__ static BF16Vec8 load(
+      __nv_bfloat16 const* addr) {
+    BF16Vec8 r;
+    *reinterpret_cast<float4*>(&r.data[0]) =
+        *reinterpret_cast<float4 const*>(addr);
+    return r;
+  }
+
+  __device__ __forceinline__ static BF16Vec8 load_volatile(
+      __nv_bfloat16 const* addr) {
+    BF16Vec8 r;
+    uint4 v;
+    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(addr));
+    *reinterpret_cast<uint4*>(&r.data[0]) = v;
+    return r;
+  }
+
+  __device__ __forceinline__ void store(__nv_bfloat16* addr) const {
+    *reinterpret_cast<float4*>(addr) =
+        *reinterpret_cast<float4 const*>(&data[0]);
+  }
+
+  __device__ __forceinline__ void remove_bf16_neg_zero() {
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      if (is_bf16_neg_zero(data[i])) {
+        data[i] = __ushort_as_bfloat16(0);
+      }
+    }
+  }
+
+  __device__ __forceinline__ bool has_fp32_neg_zero_sentinel() const {
+    uint32_t const* lanes = reinterpret_cast<uint32_t const*>(&data[0]);
+    return lanes[0] == kFp32NegZero || lanes[1] == kFp32NegZero ||
+           lanes[2] == kFp32NegZero || lanes[3] == kFp32NegZero;
+  }
+};
+
+struct Fp32NegZeroVec {
+  uint4 data{kFp32NegZero, kFp32NegZero, kFp32NegZero, kFp32NegZero};
+
+  __device__ __forceinline__ void store(void* addr) const {
+    *reinterpret_cast<uint4*>(addr) = data;
+  }
+};
+
+struct LamportFlags {
+  __device__ __forceinline__ explicit LamportFlags(uint32_t* buffer_flags)
+      : flags(buffer_flags), access_counter(&buffer_flags[8]) {
+    uint4 state = *reinterpret_cast<uint4 const*>(&buffer_flags[0]);
+    cur_idx = state.x;
+    dirty_idx = state.y;
+    bytes_per_buffer = state.z;
+    dirty_num_stages = state.w;
+    uint4 clear = *reinterpret_cast<uint4 const*>(&buffer_flags[4]);
+    bytes_to_clear[0] = clear.x;
+    bytes_to_clear[1] = clear.y;
+    bytes_to_clear[2] = clear.z;
+    bytes_to_clear[3] = clear.w;
+  }
+
+  __device__ __forceinline__ void* stage_ptr(void* base, uint32_t index,
+                                             uint32_t stage,
+                                             uint32_t num_stages) const {
+    uint32_t const bytes_per_stage = bytes_per_buffer / num_stages;
+    uint64_t const offset =
+        static_cast<uint64_t>(index * num_stages + stage) * bytes_per_stage;
+    return reinterpret_cast<void*>(reinterpret_cast<char*>(base) + offset);
+  }
+
+  __device__ __forceinline__ void* current_ptr(void* base) const {
+    return stage_ptr(base, cur_idx, 0, 1);
+  }
+
+  __device__ __forceinline__ void cta_arrive() {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      atomicAdd(access_counter, 1);
+    }
+  }
+
+  __device__ __forceinline__ void clear_dirty(void* local_base) const {
+    if (dirty_num_stages == 0) {
+      return;
+    }
+    uint32_t const global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t const num_threads = gridDim.x * blockDim.x;
+    Fp32NegZeroVec const neg_zero;
+#pragma unroll
+    for (uint32_t stage = 0; stage < 4; ++stage) {
+      if (stage >= dirty_num_stages) {
+        continue;
+      }
+      uint32_t const clear_vecs =
+          ceil_div_u32(bytes_to_clear[stage], kBytesPerAccess);
+      char* stage_base = reinterpret_cast<char*>(
+          stage_ptr(local_base, dirty_idx, stage, dirty_num_stages));
+      for (uint32_t idx = global_tid; idx < clear_vecs; idx += num_threads) {
+        neg_zero.store(stage_base + idx * kBytesPerAccess);
+      }
+    }
+  }
+
+  __device__ __forceinline__ void wait_and_update(uint32_t clear_bytes) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      while (*reinterpret_cast<uint32_t volatile*>(access_counter) <
+             static_cast<uint32_t>(gridDim.x)) {
+      }
+      flags[0] = (cur_idx + 1) % 3;
+      flags[1] = cur_idx;
+      flags[2] = bytes_per_buffer;
+      flags[3] = 1;
+      flags[4] = clear_bytes;
+      flags[5] = 0;
+      flags[6] = 0;
+      flags[7] = 0;
+      *access_counter = 0;
+    }
+  }
+
+  uint32_t* flags;
+  uint32_t* access_counter;
+  uint32_t cur_idx;
+  uint32_t dirty_idx;
+  uint32_t bytes_per_buffer;
+  uint32_t dirty_num_stages;
+  uint32_t bytes_to_clear[4];
+};
+
+template <int NRanks>
+__device__ __forceinline__ BF16Vec8 reduce_sum(BF16Vec8 const* peers) {
+  BF16Vec8 acc;
+#pragma unroll
+  for (int i = 0; i < kVecSize; ++i) {
+    float v = static_cast<float>(peers[0].data[i]);
+#pragma unroll
+    for (int r = 1; r < NRanks; ++r) {
+      v += static_cast<float>(peers[r].data[i]);
+    }
+    acc.data[i] = static_cast<__nv_bfloat16>(v);
+  }
+  return acc;
+}
+
+template <int NRanks, int HC_MULT, bool LaunchWithPdl>
+__global__ void __launch_bounds__(1024)
+    mnnvl_ar_hc_post_oneshot_kernel(Params params) {
+  int const hidden_vecs = params.hidden_dim / kVecSize;
+  int const packed_idx = threadIdx.x;
+  int const token_id = blockIdx.x;
+
+  __shared__ float post_smem[HC_MULT];
+  __shared__ float comb_smem[HC_MULT * HC_MULT];
+
+  __nv_bfloat16 const* allreduce_in_ptr =
+      reinterpret_cast<__nv_bfloat16 const*>(params.allreduce_in);
+  __nv_bfloat16 const* residual_ptr =
+      reinterpret_cast<__nv_bfloat16 const*>(params.residual);
+  float const* post_ptr = reinterpret_cast<float const*>(params.post);
+  float const* comb_ptr = reinterpret_cast<float const*>(params.comb);
+  __nv_bfloat16* out_ptr = reinterpret_cast<__nv_bfloat16*>(params.out);
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if constexpr (LaunchWithPdl) {
+    asm volatile("griddepcontrol.wait;");
+  }
+#endif
+
+  LamportFlags flag(params.buffer_flags);
+  void* local_base = params.buffer_ptrs_dev[params.rank];
+  __nv_bfloat16* stage_mcast =
+      reinterpret_cast<__nv_bfloat16*>(flag.current_ptr(params.multicast_ptr));
+  __nv_bfloat16 const* stage_local =
+      reinterpret_cast<__nv_bfloat16 const*>(flag.current_ptr(local_base));
+
+  if (packed_idx >= hidden_vecs) {
+    flag.cta_arrive();
+    flag.clear_dirty(local_base);
+    return;
+  }
+
+  for (int i = packed_idx; i < HC_MULT; i += blockDim.x) {
+    post_smem[i] = post_ptr[token_id * HC_MULT + i];
+  }
+  for (int i = packed_idx; i < HC_MULT * HC_MULT; i += blockDim.x) {
+    comb_smem[i] = comb_ptr[token_id * HC_MULT * HC_MULT + i];
+  }
+  __syncthreads();
+
+  int const elem_offset = token_id * params.hidden_dim + packed_idx * kVecSize;
+  BF16Vec8 local = BF16Vec8::load(allreduce_in_ptr + elem_offset);
+  local.remove_bf16_neg_zero();
+  __nv_bfloat16* dst =
+      stage_mcast + token_id * params.hidden_dim * NRanks +
+      params.rank * params.hidden_dim + packed_idx * kVecSize;
+  local.store(dst);
+
+  flag.cta_arrive();
+  flag.clear_dirty(local_base);
+
+  BF16Vec8 peer_vals[NRanks];
+  bool valid = false;
+  while (!valid) {
+    valid = true;
+#pragma unroll
+    for (int r = 0; r < NRanks; ++r) {
+      __nv_bfloat16 const* src =
+          stage_local + token_id * params.hidden_dim * NRanks +
+          r * params.hidden_dim + packed_idx * kVecSize;
+      peer_vals[r] = BF16Vec8::load_volatile(src);
+      valid &= !peer_vals[r].has_fp32_neg_zero_sentinel();
+    }
+  }
+
+  BF16Vec8 ar_sum = reduce_sum<NRanks>(peer_vals);
+
+  BF16Vec8 residual_reg[HC_MULT];
+#pragma unroll
+  for (int hci = 0; hci < HC_MULT; ++hci) {
+    __nv_bfloat16 const* base =
+        residual_ptr +
+        ((token_id * HC_MULT + hci) * params.hidden_dim +
+         packed_idx * kVecSize);
+    residual_reg[hci] = BF16Vec8::load(base);
+  }
+
+#pragma unroll
+  for (int hco = 0; hco < HC_MULT; ++hco) {
+    float const post_val = post_smem[hco];
+    float acc[kVecSize];
+#pragma unroll
+    for (int e = 0; e < kVecSize; ++e) {
+      acc[e] = post_val * static_cast<float>(ar_sum.data[e]);
+    }
+#pragma unroll
+    for (int hci = 0; hci < HC_MULT; ++hci) {
+      float const c = comb_smem[hci * HC_MULT + hco];
+#pragma unroll
+      for (int e = 0; e < kVecSize; ++e) {
+        acc[e] += c * static_cast<float>(residual_reg[hci].data[e]);
+      }
+    }
+    BF16Vec8 out_vec;
+#pragma unroll
+    for (int e = 0; e < kVecSize; ++e) {
+      out_vec.data[e] = static_cast<__nv_bfloat16>(acc[e]);
+    }
+    __nv_bfloat16* out_dst =
+        out_ptr +
+        ((token_id * HC_MULT + hco) * params.hidden_dim +
+         packed_idx * kVecSize);
+    out_vec.store(out_dst);
+  }
+
+  uint64_t const clear_bytes_u64 =
+      static_cast<uint64_t>(params.num_tokens) * params.hidden_dim * NRanks *
+      sizeof(__nv_bfloat16);
+  flag.wait_and_update(static_cast<uint32_t>(clear_bytes_u64));
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if constexpr (LaunchWithPdl) {
+    asm volatile("griddepcontrol.launch_dependents;");
+  }
+#endif
+}
+
+static int get_sm_version_cached() {
+  static int sm = 0;
+  if (sm == 0) {
+    int dev;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    int major = 0;
+    int minor = 0;
+    CUDA_CHECK(
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
+    CUDA_CHECK(
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev));
+    sm = major * 10 + minor;
+  }
+  return sm;
+}
+
+template <int NRanks, int HC_MULT>
+static void launch(Params const& params, bool launch_with_pdl) {
+  TORCH_CHECK(params.hidden_dim % kVecSize == 0,
+              "hidden_dim must be divisible by ", kVecSize);
+  int const threads = params.hidden_dim / kVecSize;
+  TORCH_CHECK(threads <= 1024,
+              "MNNVL fused AR + hc_post currently requires hidden_dim/",
+              kVecSize, " <= 1024, got ", threads);
+  uint64_t const clear_bytes =
+      static_cast<uint64_t>(params.num_tokens) * params.hidden_dim * NRanks *
+      sizeof(__nv_bfloat16);
+  TORCH_CHECK(clear_bytes <= UINT32_MAX,
+              "MNNVL fused AR + hc_post one-shot buffer is too large: ",
+              clear_bytes, " bytes");
+
+  cudaLaunchConfig_t cfg{};
+  cfg.gridDim = params.num_tokens;
+  cfg.blockDim = threads;
+  cfg.dynamicSmemBytes = 0;
+  cfg.stream = params.stream;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = launch_with_pdl ? 1 : 0;
+  cfg.attrs = (get_sm_version_cached() >= 90) ? attr : nullptr;
+  cfg.numAttrs = (get_sm_version_cached() >= 90) ? 1 : 0;
+
+  if (launch_with_pdl) {
+    CUDA_CHECK(cudaLaunchKernelEx(
+        &cfg, mnnvl_ar_hc_post_oneshot_kernel<NRanks, HC_MULT, true>,
+        params));
+  } else {
+    CUDA_CHECK(cudaLaunchKernelEx(
+        &cfg, mnnvl_ar_hc_post_oneshot_kernel<NRanks, HC_MULT, false>,
+        params));
+  }
+}
+
+void run(Params const& params, bool launch_with_pdl) {
+  TORCH_CHECK(params.hc_mult == 4,
+              "Only hc_mult == 4 is currently supported, got ", params.hc_mult);
+  switch (params.nranks) {
+    case 2:
+      launch<2, 4>(params, launch_with_pdl);
+      break;
+    case 4:
+      launch<4, 4>(params, launch_with_pdl);
+      break;
+    case 8:
+      launch<8, 4>(params, launch_with_pdl);
+      break;
+    default:
+      TORCH_CHECK(false, "mnnvl_ar_hc_post: unsupported nranks=",
+                  params.nranks, " (supported: 2, 4, 8)");
+  }
+}
+
+}  // namespace mnnvl_ar_hc_post
+}  // namespace vllm
+
+void mnnvl_ar_hc_post(torch::Tensor const& allreduce_in,
+                      torch::Tensor const& residual, torch::Tensor const& post,
+                      torch::Tensor const& comb, torch::Tensor& out,
+                      int64_t multicast_ptr, int64_t buffer_ptrs_dev,
+                      torch::Tensor& buffer_flags, int64_t rank,
+                      int64_t nranks, bool launch_with_pdl) {
+  TORCH_CHECK(allreduce_in.is_cuda() && residual.is_cuda() && post.is_cuda() &&
+                  comb.is_cuda() && out.is_cuda() && buffer_flags.is_cuda(),
+              "All tensor arguments must be CUDA");
+  TORCH_CHECK(allreduce_in.scalar_type() == at::ScalarType::BFloat16,
+              "allreduce_in must be bf16");
+  TORCH_CHECK(residual.scalar_type() == at::ScalarType::BFloat16,
+              "residual must be bf16");
+  TORCH_CHECK(out.scalar_type() == at::ScalarType::BFloat16,
+              "out must be bf16");
+  TORCH_CHECK(post.scalar_type() == at::ScalarType::Float, "post must be fp32");
+  TORCH_CHECK(comb.scalar_type() == at::ScalarType::Float, "comb must be fp32");
+  TORCH_CHECK(buffer_flags.scalar_type() == at::ScalarType::UInt32,
+              "buffer_flags must be uint32");
+
+  TORCH_CHECK(allreduce_in.dim() == 2,
+              "allreduce_in must be [N, H], got dim=", allreduce_in.dim());
+  TORCH_CHECK(residual.dim() == 3,
+              "residual must be [N, hc, H], got dim=", residual.dim());
+  TORCH_CHECK(post.dim() == 3 || post.dim() == 2,
+              "post must be [N, hc] or [N, hc, 1], got dim=", post.dim());
+  TORCH_CHECK(comb.dim() == 3,
+              "comb must be [N, hc, hc], got dim=", comb.dim());
+  TORCH_CHECK(out.dim() == 3, "out must be [N, hc, H], got dim=", out.dim());
+
+  int const N = static_cast<int>(allreduce_in.size(0));
+  int const H = static_cast<int>(allreduce_in.size(1));
+  int const HC = static_cast<int>(residual.size(1));
+
+  TORCH_CHECK(residual.size(0) == N && residual.size(2) == H,
+              "residual shape mismatch");
+  TORCH_CHECK(post.size(0) == N && post.size(1) == HC, "post shape mismatch");
+  TORCH_CHECK(comb.size(0) == N && comb.size(1) == HC && comb.size(2) == HC,
+              "comb shape mismatch");
+  TORCH_CHECK(out.size(0) == N && out.size(1) == HC && out.size(2) == H,
+              "out shape mismatch");
+
+  TORCH_CHECK(allreduce_in.is_contiguous(), "allreduce_in must be contiguous");
+  TORCH_CHECK(residual.is_contiguous(), "residual must be contiguous");
+  TORCH_CHECK(post.is_contiguous(), "post must be contiguous");
+  TORCH_CHECK(comb.is_contiguous(), "comb must be contiguous");
+  TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+  TORCH_CHECK(buffer_flags.numel() >= 9,
+              "buffer_flags must contain at least 9 uint32 values");
+
+  c10::cuda::CUDAGuard guard(allreduce_in.device());
+
+  vllm::mnnvl_ar_hc_post::Params params;
+  params.nranks = static_cast<int>(nranks);
+  params.rank = static_cast<int>(rank);
+  params.num_tokens = N;
+  params.hidden_dim = H;
+  params.hc_mult = HC;
+  params.buffer_ptrs_dev = reinterpret_cast<void**>(buffer_ptrs_dev);
+  params.multicast_ptr = reinterpret_cast<void*>(multicast_ptr);
+  params.buffer_flags =
+      reinterpret_cast<uint32_t*>(buffer_flags.mutable_data_ptr());
+  params.allreduce_in = allreduce_in.data_ptr();
+  params.residual = residual.data_ptr();
+  params.post = post.data_ptr();
+  params.comb = comb.data_ptr();
+  params.out = out.mutable_data_ptr();
+  params.stream = at::cuda::getCurrentCUDAStream(allreduce_in.get_device());
+
+  vllm::mnnvl_ar_hc_post::run(params, launch_with_pdl);
+}

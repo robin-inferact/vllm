@@ -336,4 +336,10 @@ void trtllm_ar_hc_post(torch::Tensor const& allreduce_in,
                        torch::Tensor const& comb, torch::Tensor& out,
                        torch::Tensor& workspace, int64_t rank, int64_t nranks,
                        bool launch_with_pdl, bool use_oneshot);
+void mnnvl_ar_hc_post(torch::Tensor const& allreduce_in,
+                      torch::Tensor const& residual, torch::Tensor const& post,
+                      torch::Tensor const& comb, torch::Tensor& out,
+                      int64_t multicast_ptr, int64_t buffer_ptrs_dev,
+                      torch::Tensor& buffer_flags, int64_t rank,
+                      int64_t nranks, bool launch_with_pdl);
 #endif

@@ -554,6 +554,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool use_oneshot) -> ()");
   ops.impl("trtllm_ar_hc_post", torch::kCUDA, &trtllm_ar_hc_post);
 
+  ops.def(
+      "mnnvl_ar_hc_post("
+      "Tensor allreduce_in,"
+      "Tensor residual,"
+      "Tensor post,"
+      "Tensor comb,"
+      "Tensor! out,"
+      "int multicast_ptr,"
+      "int buffer_ptrs_dev,"
+      "Tensor! buffer_flags,"
+      "int rank,"
+      "int nranks,"
+      "bool launch_with_pdl) -> ()");
+  ops.impl("mnnvl_ar_hc_post", torch::kCUDA, &mnnvl_ar_hc_post);
+
   //  conditionally compiled so impl in source file
 #endif
 }

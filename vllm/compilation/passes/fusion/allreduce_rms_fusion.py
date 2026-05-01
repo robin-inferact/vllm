@@ -99,6 +99,7 @@ _FI_ALLREDUCE_ONE_SHOT_MAX_SIZES_MB: dict[int, dict[int, float]] = {
 if flashinfer_comm is not None:
     from vllm.distributed.device_communicators.flashinfer_all_reduce import (
         destroy_fi_ar_workspace,
+        get_fi_ar_oneshot_workspace,
         get_fi_ar_quant_workspace,
         get_fi_ar_workspace,
     )
@@ -287,18 +288,48 @@ if flashinfer_comm is not None:
             dtype=allreduce_in.dtype,
             device=allreduce_in.device,
         )
-        torch.ops._C.trtllm_ar_hc_post(
-            allreduce_in,
-            residual,
-            post,
-            comb,
-            out,
-            workspace.workspace_tensor,
-            rank,
-            world_size,
-            launch_with_pdl,
-            use_oneshot,
-        )
+        if workspace.backend == "trtllm":
+            torch.ops._C.trtllm_ar_hc_post(
+                allreduce_in,
+                residual,
+                post,
+                comb,
+                out,
+                workspace.workspace_tensor,
+                rank,
+                world_size,
+                launch_with_pdl,
+                use_oneshot,
+            )
+        elif workspace.backend == "mnnvl" and use_oneshot:
+            oneshot_workspace = get_fi_ar_oneshot_workspace(
+                world_size=world_size,
+                rank=rank,
+                max_token_num=max_token_num,
+                hidden_dim=hidden_size,
+                dtype=allreduce_in.dtype,
+                group=get_tp_group().device_group,
+            )
+            assert oneshot_workspace is not None, (
+                "Flashinfer one-shot allreduce workspace must be initialized "
+                "when using MNNVL fused AR + hc_post"
+            )
+            torch.ops._C.mnnvl_ar_hc_post(
+                allreduce_in,
+                residual,
+                post,
+                comb,
+                out,
+                oneshot_workspace.mc_ptr,
+                oneshot_workspace.uc_ptrs_dev,
+                oneshot_workspace.buffer_flags,
+                rank,
+                world_size,
+                launch_with_pdl,
+            )
+        else:
+            x_ar = tensor_model_parallel_all_reduce(allreduce_in)
+            out.copy_(torch.ops.vllm.mhc_post(x_ar, residual, post, comb))
         return out
 
     def call_trtllm_ar_hc_post_fake(

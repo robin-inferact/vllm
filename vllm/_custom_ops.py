@@ -3726,3 +3726,22 @@ if hasattr(torch.ops._C, "trtllm_ar_hc_post"):
         use_oneshot: bool,
     ) -> None:
         return None
+
+
+if hasattr(torch.ops._C, "mnnvl_ar_hc_post"):
+
+    @register_fake("_C::mnnvl_ar_hc_post")
+    def _mnnvl_ar_hc_post_fake(
+        allreduce_in: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        out: torch.Tensor,
+        multicast_ptr: int,
+        buffer_ptrs_dev: int,
+        buffer_flags: torch.Tensor,
+        rank: int,
+        nranks: int,
+        launch_with_pdl: bool,
+    ) -> None:
+        return None

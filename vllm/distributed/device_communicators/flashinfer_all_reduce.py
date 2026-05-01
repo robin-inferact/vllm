@@ -33,6 +33,9 @@ except ImportError:
 
 # Workspace for standalone allreduce and non-quant ar+rms fusion
 _fi_ar_workspace = None
+# Extra workspace for one-shot-only MNNVL fusion patterns whose buffer
+# requirement can be larger than FlashInfer's default MNNVL heuristic.
+_fi_ar_oneshot_workspace = None
 # Extra workspace for quant fusion patterns (only supported by trtllm backend)
 _fi_ar_quant_workspace = None
 
@@ -45,6 +48,7 @@ def _create_workspace(
     hidden_dim: int,
     dtype: torch.dtype,
     group: ProcessGroup,
+    force_oneshot_support: bool = False,
 ):
     """Create a flashinfer allreduce workspace, returning None on failure."""
     comm_backend = TorchDistBackend(group=group)
@@ -59,6 +63,7 @@ def _create_workspace(
             hidden_dim=hidden_dim,
             dtype=dtype,
             comm_backend=comm_backend,
+            force_oneshot_support=force_oneshot_support,
         )
     except Exception as e:
         if "multicast" in str(e).lower():
@@ -159,6 +164,57 @@ def get_fi_ar_workspace(
     return _fi_ar_workspace
 
 
+def get_fi_ar_oneshot_workspace(
+    world_size: int,
+    rank: int,
+    max_token_num: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    group: ProcessGroup,
+):
+    """
+    Return a workspace sized for forced one-shot allreduce.
+
+    This is primarily needed for MNNVL: its default workspace allocation may
+    choose a smaller two-shot-sized buffer for larger token counts, while a
+    custom fused kernel can still intentionally use the one-shot protocol.
+    """
+    global _fi_ar_oneshot_workspace
+    if _fi_ar_oneshot_workspace is not None:
+        return _fi_ar_oneshot_workspace
+
+    backend = _resolve_fi_ar_backend()
+
+    if get_node_count() > 1 and backend == "trtllm":
+        raise ValueError(
+            "Flashinfer allreduce is not supported for multi-node allreduce with "
+            "'trtllm' backend. Please use 'mnnvl' backend instead."
+        )
+
+    _fi_ar_oneshot_workspace = _create_workspace(
+        backend,
+        world_size,
+        rank,
+        max_token_num,
+        hidden_dim,
+        dtype,
+        group,
+        force_oneshot_support=True,
+    )
+    if _fi_ar_oneshot_workspace is not None:
+        logger.info_once(
+            "Initialized FlashInfer one-shot Allreduce workspace "
+            f"with backend={backend}"
+        )
+    else:
+        logger.warning_once(
+            "Failed to initialize FlashInfer one-shot Allreduce workspace "
+            f"with backend={backend}"
+        )
+
+    return _fi_ar_oneshot_workspace
+
+
 def get_fi_ar_quant_workspace(
     world_size: int,
     rank: int,
@@ -211,16 +267,22 @@ _fi_ar_workspace_lock = threading.Lock()
 
 
 def destroy_fi_ar_workspace():
-    global _fi_ar_workspace, _fi_ar_quant_workspace
+    global _fi_ar_workspace, _fi_ar_oneshot_workspace, _fi_ar_quant_workspace
     with _fi_ar_workspace_lock:
         is_alias = _fi_ar_workspace is _fi_ar_quant_workspace
+        oneshot_alias = (
+            _fi_ar_oneshot_workspace is _fi_ar_workspace
+            or _fi_ar_oneshot_workspace is _fi_ar_quant_workspace
+        )
 
         if _fi_ar_workspace is not None:
             _fi_ar_workspace.destroy()
+        if _fi_ar_oneshot_workspace is not None and not oneshot_alias:
+            _fi_ar_oneshot_workspace.destroy()
         if _fi_ar_quant_workspace is not None and not is_alias:
             _fi_ar_quant_workspace.destroy()
 
-        _fi_ar_workspace = _fi_ar_quant_workspace = None
+        _fi_ar_workspace = _fi_ar_oneshot_workspace = _fi_ar_quant_workspace = None
 
 
 atexit.register(destroy_fi_ar_workspace)

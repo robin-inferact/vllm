@@ -13,6 +13,8 @@ import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from cuda.bindings.driver import CUstream
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
@@ -118,6 +120,9 @@ _kimi_moe_setup_log_lock = threading.Lock()
 _kimi_moe_setup_log_keys: set[tuple[int, int, int, int, int, int, bool]] = set()
 _kimi_moe_runtime_log_lock = threading.Lock()
 _kimi_moe_runtime_log_keys: set[tuple[int, int, int, int, bool]] = set()
+_KIMI_ROUTER_SPLIT_K = 14
+_KIMI_ROUTER_SPLIT_ROW_BLOCK_N = 16
+_KIMI_ROUTER_SPLIT_ROW_BLOCK_K = 128
 
 
 def _kimi_tensor_meta(tensor: torch.Tensor | None) -> str:
@@ -128,6 +133,113 @@ def _kimi_tensor_meta(tensor: torch.Tensor | None) -> str:
         f"dtype={tensor.dtype}, device={tensor.device}, "
         f"contiguous={tensor.is_contiguous()}"
     )
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _kimi_disable_attention_ar_pdl() -> bool:
+    return _env_flag("VLLM_KIMI_DISABLE_ATTN_AR_PDL")
+
+
+def _kimi_router_gemm_backend() -> str:
+    return os.getenv("VLLM_KIMI_ROUTER_GEMM", "cublaslt").strip().lower()
+
+
+@triton.jit
+def _kimi_router_splitk_row_stage1(
+    x,
+    weight,
+    partials,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    EXPERTS: tl.constexpr,
+    K_PER_SPLIT: tl.constexpr,
+    SPLITS: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_s = tl.program_id(2)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    k_base = pid_s * K_PER_SPLIT
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for k0 in range(0, K_PER_SPLIT, BLOCK_K):
+        k = k_base + k0 + offs_k
+        a = tl.load(x + pid_m * HIDDEN + k)
+        b = tl.load(
+            weight + offs_n[:, None] * HIDDEN + k[None, :],
+            mask=offs_n[:, None] < EXPERTS,
+            other=0.0,
+        )
+        acc += tl.sum(b.to(tl.float32) * a[None, :].to(tl.float32), axis=1)
+
+    offset = (pid_m * SPLITS + pid_s) * EXPERTS + offs_n
+    tl.store(partials + offset, acc, mask=offs_n < EXPERTS)
+
+
+@triton.jit
+def _kimi_router_splitk_row_reduce(
+    partials,
+    out,
+    BLOCK_N: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    EXPERTS: tl.constexpr,
+    SPLITS: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_s = tl.arange(0, BLOCK_S)
+    vals = tl.load(
+        partials + (pid_m * SPLITS + offs_s[:, None]) * EXPERTS + offs_n[None, :],
+        mask=(offs_s[:, None] < SPLITS) & (offs_n[None, :] < EXPERTS),
+        other=0.0,
+    )
+    acc = tl.sum(vals, axis=0)
+    tl.store(out + pid_m * EXPERTS + offs_n, acc, mask=offs_n < EXPERTS)
+
+
+def _kimi_k25_router_gemm_triton_splitk_row(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    partials: torch.Tensor,
+) -> torch.Tensor:
+    tokens, hidden = x.shape
+    experts = weight.shape[0]
+    out = torch.empty((tokens, experts), dtype=torch.float32, device=x.device)
+    k_per_split = hidden // _KIMI_ROUTER_SPLIT_K
+    grid_stage1 = (
+        triton.cdiv(experts, _KIMI_ROUTER_SPLIT_ROW_BLOCK_N),
+        tokens,
+        _KIMI_ROUTER_SPLIT_K,
+    )
+    grid_reduce = (triton.cdiv(experts, _KIMI_ROUTER_SPLIT_ROW_BLOCK_N), tokens)
+    _kimi_router_splitk_row_stage1[grid_stage1](
+        x,
+        weight,
+        partials,
+        BLOCK_N=_KIMI_ROUTER_SPLIT_ROW_BLOCK_N,
+        BLOCK_K=_KIMI_ROUTER_SPLIT_ROW_BLOCK_K,
+        HIDDEN=hidden,
+        EXPERTS=experts,
+        K_PER_SPLIT=k_per_split,
+        SPLITS=_KIMI_ROUTER_SPLIT_K,
+        num_warps=8,
+    )
+    _kimi_router_splitk_row_reduce[grid_reduce](
+        partials,
+        out,
+        BLOCK_N=_KIMI_ROUTER_SPLIT_ROW_BLOCK_N,
+        BLOCK_S=triton.next_power_of_2(_KIMI_ROUTER_SPLIT_K),
+        EXPERTS=experts,
+        SPLITS=_KIMI_ROUTER_SPLIT_K,
+        num_warps=1,
+    )
+    return out
 
 
 def _destroy_kimi_attention_ar_workspace() -> None:
@@ -2310,6 +2422,13 @@ def _kimi_k25_nvfp4_attention_allreduce_norm(
         dtype=allreduce_in.dtype,
         group=tp_group.device_group,
     )
+    disable_attention_ar_pdl = _kimi_disable_attention_ar_pdl()
+    trigger_completion_at_end = disable_attention_ar_pdl
+    if disable_attention_ar_pdl:
+        logger.info_once(
+            "Disabling downstream PDL release from Kimi attention "
+            "allreduce/norm via VLLM_KIMI_DISABLE_ATTN_AR_PDL."
+        )
 
     flashinfer_comm.trtllm_allreduce_fusion(
         allreduce_in=allreduce_in.view(-1),
@@ -2319,7 +2438,7 @@ def _kimi_k25_nvfp4_attention_allreduce_norm(
         hidden_dim=hidden_dim,
         workspace_ptrs=workspace.workspace_tensor,
         launch_with_pdl=True,
-        trigger_completion_at_end=False,
+        trigger_completion_at_end=trigger_completion_at_end,
         fp32_acc=True,
         pattern_code=flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
         use_oneshot=None,
@@ -2954,6 +3073,10 @@ class KimiK25Nvfp4MoE(nn.Module):
             out_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
+        self._router_splitk_partials: torch.Tensor | None = None
+        self._router_splitk_max_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
         if getattr(config, "topk_method", None) == "noaux_tc":
             self.gate.e_score_correction_bias = nn.Parameter(
                 torch.empty(config.n_routed_experts, dtype=torch.bfloat16)
@@ -2994,7 +3117,71 @@ class KimiK25Nvfp4MoE(nn.Module):
             self.physical_expert_start + self.n_local_physical_experts
         )
 
+    def _router_splitk_partials_buffer(
+        self,
+        *,
+        tokens: int,
+        experts: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        partials = self._router_splitk_partials
+        min_tokens = max(tokens, self._router_splitk_max_tokens)
+        if (
+            partials is None
+            or partials.device != device
+            or partials.shape[0] < min_tokens
+            or partials.shape[2] != experts
+        ):
+            partials = torch.empty(
+                (min_tokens, _KIMI_ROUTER_SPLIT_K, experts),
+                dtype=torch.float32,
+                device=device,
+            )
+            self._router_splitk_partials = partials
+        return partials[:tokens]
+
+    def _router_logits_triton_splitk_row(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        weight = self.gate.weight
+        if (
+            hidden_states.dtype != torch.bfloat16
+            or weight.dtype != torch.bfloat16
+            or hidden_states.dim() != 2
+            or weight.dim() != 2
+            or hidden_states.shape[1] != weight.shape[1]
+            or hidden_states.shape[1] % _KIMI_ROUTER_SPLIT_K != 0
+            or not hidden_states.is_contiguous()
+            or not weight.is_contiguous()
+        ):
+            logger.warning_once(
+                "Falling back to cuBLASLt Kimi router GEMM because the "
+                "Triton split-k row preconditions were not met."
+            )
+            return ops.kimi_k25_router_gemm_bf16_fp32_cublaslt(
+                hidden_states,
+                weight,
+            )
+
+        logger.info_once("Using Triton split-k row Kimi router GEMM.")
+        partials = self._router_splitk_partials_buffer(
+            tokens=hidden_states.shape[0],
+            experts=weight.shape[0],
+            device=hidden_states.device,
+        )
+        return _kimi_k25_router_gemm_triton_splitk_row(
+            hidden_states,
+            weight,
+            partials,
+        )
+
     def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if (
+            _kimi_router_gemm_backend() == "triton_splitk_row"
+            and hidden_states.shape[0] <= 4
+        ):
+            return self._router_logits_triton_splitk_row(hidden_states)
         return ops.kimi_k25_router_gemm_bf16_fp32_cublaslt(
             hidden_states,
             self.gate.weight,

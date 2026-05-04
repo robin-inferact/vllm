@@ -144,7 +144,7 @@ def _kimi_disable_attention_ar_pdl() -> bool:
 
 
 def _kimi_router_gemm_backend() -> str:
-    return os.getenv("VLLM_KIMI_ROUTER_GEMM", "cublaslt").strip().lower()
+    return os.getenv("VLLM_KIMI_ROUTER_GEMM", "").strip().lower()
 
 
 @triton.jit
@@ -3182,9 +3182,10 @@ class KimiK25Nvfp4MoE(nn.Module):
             and hidden_states.shape[0] <= 4
         ):
             return self._router_logits_triton_splitk_row(hidden_states)
-        return ops.kimi_k25_router_gemm_bf16_fp32_cublaslt(
+        return torch.mm(
             hidden_states,
-            self.gate.weight,
+            self.gate.weight.t(),
+            out_dtype=torch.float32,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

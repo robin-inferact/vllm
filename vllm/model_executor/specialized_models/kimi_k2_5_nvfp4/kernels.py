@@ -7,61 +7,40 @@ FP8 quantization, and KV-cache-write steps used by the Kimi-K2.5 NVFP4
 runtime profile. They are checked in independently of the specialized
 model so the model implementation can import them once it lands.
 
-Each public ``_run_*`` helper wraps a ``@cute.jit`` launcher and a
-``@cute.kernel`` device function, compiling lazily through a per-process
-executor cache keyed on tensor layouts and the active CUDA device.
+Each public ``_run_*`` helper pairs a ``@cute.jit`` launcher with a
+``@cute.kernel`` device function. Compilation is cached per constexpr
+configuration by a ``functools.cache``-decorated ``_compile_*`` helper that
+builds fake tensors with symbolic shapes/strides and calls ``cute.compile``,
+following the convention in ``vllm/v1/attention/ops/deepseek_v4_ops``. The
+compiled executor is then called directly with torch tensors and sources its
+launch stream from the TVM-FFI environment.
 """
 
-from typing import Any
+from functools import cache
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
 import torch
 from cuda.bindings.driver import CUstream
+from cutlass import BFloat16, Float32, Int64, Uint8
 from cutlass._mlir.dialects import llvm
-from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from vllm.platforms import current_platform
 
-_CUTEDSL_EXECUTOR_CACHE: dict[tuple[Any, ...], Any] = {}
 
-
-def _get_cutedsl_executor(
-    cache_key: tuple[Any, ...],
-    jit_fn: Any,
-    **compile_kwargs: Any,
-) -> Any:
-    executor = _CUTEDSL_EXECUTOR_CACHE.get(cache_key)
-    if executor is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "CuTeDSL executor cache miss during CUDA graph capture for "
-                f"{cache_key[0]!r}. Run an eager warmup before capture."
-            )
-        executor = cute.compile(jit_fn, **compile_kwargs).to(None)
-        _CUTEDSL_EXECUTOR_CACHE[cache_key] = executor
-    return executor
-
-
-def _cutedsl_arg_cache_key(arg: Any) -> Any:
-    cache_key = getattr(arg, "__cache_key__", None)
-    return arg if cache_key is None else cache_key
-
-
-def _make_dynamic_cute_tensor(data: torch.Tensor):
-    return from_dlpack(data, assumed_align=16).mark_layout_dynamic(
-        leading_dim=cutlass_torch.get_leading_dim(data)
+def _fake(dtype, shape, stride, *, align):
+    """Build a fake (compile-time only) CuTe tensor for ``cute.compile``."""
+    return cute.runtime.make_fake_tensor(
+        dtype, shape, stride=stride, assumed_align=align
     )
 
 
-def _make_fully_dynamic_cute_tensor(data: torch.Tensor):
-    return from_dlpack(data, assumed_align=16).mark_layout_dynamic()
-
-
-def _cuda_device_cache_key() -> int:
-    return torch.cuda.current_device() if torch.cuda.is_available() else -1
+def _fake_stream():
+    # The compiled executor sources its launch stream from the TVM-FFI
+    # environment (set by ``options="--enable-tvm-ffi"``), so callers do not
+    # pass a stream at runtime.
+    return cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
 
 @dsl_user_op
@@ -844,6 +823,39 @@ def kimi_fused_rmsnorm(
     ).launch(grid=grid, block=block, stream=stream)
 
 
+@cache
+def _compile_concat_and_cache_mla(
+    kv_lora_rank: int,
+    pe_dim: int,
+    kv_cache_block_factor: int,
+):
+    kv_c = _fake(
+        BFloat16, (cute.sym_int(), kv_lora_rank), (cute.sym_int64(), 1), align=16
+    )
+    k_pe = _fake(BFloat16, (cute.sym_int(), pe_dim), (cute.sym_int64(), 1), align=16)
+    kv_cache = _fake(
+        Uint8,
+        (cute.sym_int(), cute.sym_int(), kv_lora_rank + pe_dim),
+        (cute.sym_int64(), cute.sym_int64(), 1),
+        align=16,
+    )
+    slot_mapping = _fake(Int64, (cute.sym_int(),), (cute.sym_int64(),), align=16)
+    scale = _fake(Float32, (1,), (1,), align=4)
+    return cute.compile(
+        kimik25_concat_and_cache_mla,
+        kv_c,
+        k_pe,
+        kv_cache,
+        slot_mapping,
+        scale,
+        kv_lora_rank,
+        pe_dim,
+        kv_cache_block_factor,
+        _fake_stream(),
+        options="--enable-tvm-ffi",
+    )
+
+
 def _run_kimik25_concat_and_cache_mla(
     *,
     kv_c: torch.Tensor,
@@ -860,45 +872,53 @@ def _run_kimik25_concat_and_cache_mla(
     assert kv_lora_rank == 512, "Kimi-K2.5 NVFP4 expects kv_lora_rank=512"
     assert pe_dim == 64, "Kimi-K2.5 NVFP4 expects qk_rope_head_dim=64"
     kv_cache_block_factor = 4
-    scale = scale.view(1)
 
-    kv_c_cute = _make_dynamic_cute_tensor(kv_c)
-    k_pe_cute = _make_dynamic_cute_tensor(k_pe)
-    kv_cache_cute = _make_dynamic_cute_tensor(kv_cache)
-    slot_mapping_cute = _make_fully_dynamic_cute_tensor(slot_mapping)
-    scale_cute = from_dlpack(scale, assumed_align=4)
-    cache_key = (
-        "kimik25_concat_and_cache_mla",
-        _cuda_device_cache_key(),
-        _cutedsl_arg_cache_key(kv_c_cute),
-        _cutedsl_arg_cache_key(k_pe_cute),
-        _cutedsl_arg_cache_key(kv_cache_cute),
-        _cutedsl_arg_cache_key(slot_mapping_cute),
-        _cutedsl_arg_cache_key(scale_cute),
-        kv_lora_rank,
+    _compile_concat_and_cache_mla(kv_lora_rank, pe_dim, kv_cache_block_factor)(
+        kv_c, k_pe, kv_cache, slot_mapping, scale.view(1)
+    )
+
+
+@cache
+def _compile_rmsnorm_special_qkv_fused(
+    lora_dim_q: int,
+    lora_dim_kv: int,
+    pe_dim: int,
+    eps_q: float,
+    eps_kv: float,
+):
+    data = _fake(
+        BFloat16,
+        (cute.sym_int(), lora_dim_q + lora_dim_kv),
+        (cute.sym_int64(divisibility=2), 1),
+        align=16,
+    )
+    positions = _fake(Int64, (cute.sym_int(),), (cute.sym_int64(),), align=16)
+    k_pe = _fake(
+        BFloat16,
+        (cute.sym_int(), pe_dim),
+        (cute.sym_int64(divisibility=2), 1),
+        align=16,
+    )
+    cos_sin_cache = _fake(
+        BFloat16, (cute.sym_int(), pe_dim), (cute.sym_int64(), 1), align=16
+    )
+    weights_q = _fake(BFloat16, (lora_dim_q,), (1,), align=16)
+    weights_kv = _fake(BFloat16, (lora_dim_kv,), (1,), align=16)
+    return cute.compile(
+        kimik25_rmsnorm_special_qkv_fused,
+        data,
+        positions,
+        k_pe,
+        cos_sin_cache,
+        weights_q,
+        weights_kv,
+        lora_dim_q,
+        lora_dim_kv,
         pe_dim,
-        kv_cache_block_factor,
-    )
-    executor = _get_cutedsl_executor(
-        cache_key,
-        kimik25_concat_and_cache_mla,
-        kv_c=kv_c_cute,
-        k_pe=k_pe_cute,
-        kv_cache=kv_cache_cute,
-        slot_mapping=slot_mapping_cute,
-        scale=scale_cute,
-        kv_lora_rank=kv_lora_rank,
-        pe_dim=pe_dim,
-        kv_cache_block_factor=kv_cache_block_factor,
-        stream=cutlass_torch.current_stream(),
-    )
-    executor(
-        kv_c=kv_c_cute,
-        k_pe=k_pe_cute,
-        kv_cache=kv_cache_cute,
-        slot_mapping=slot_mapping_cute,
-        scale=scale_cute,
-        stream=cutlass_torch.current_stream(),
+        eps_q,
+        eps_kv,
+        _fake_stream(),
+        options="--enable-tvm-ffi",
     )
 
 
@@ -916,51 +936,32 @@ def _run_kimik25_rmsnorm_special_qkv_fused(
     eps_q: float,
     eps_kv: float,
 ) -> None:
-    data_cute = _make_dynamic_cute_tensor(data)
-    positions_cute = _make_fully_dynamic_cute_tensor(positions)
-    k_pe_cute = _make_dynamic_cute_tensor(k_pe)
-    cos_sin_cache_cute = from_dlpack(cos_sin_cache, assumed_align=16)
-    weights_q_cute = from_dlpack(weights_q, assumed_align=16)
-    weights_kv_cute = from_dlpack(weights_kv, assumed_align=16)
-    cache_key = (
-        "kimik25_rmsnorm_special_qkv_fused",
-        _cuda_device_cache_key(),
-        _cutedsl_arg_cache_key(data_cute),
-        _cutedsl_arg_cache_key(positions_cute),
-        _cutedsl_arg_cache_key(k_pe_cute),
-        _cutedsl_arg_cache_key(cos_sin_cache_cute),
-        _cutedsl_arg_cache_key(weights_q_cute),
-        _cutedsl_arg_cache_key(weights_kv_cute),
-        lora_dim_q,
-        lora_dim_kv,
-        pe_dim,
-        float(eps_q),
-        float(eps_kv),
+    _compile_rmsnorm_special_qkv_fused(
+        lora_dim_q, lora_dim_kv, pe_dim, float(eps_q), float(eps_kv)
+    )(data, positions, k_pe, cos_sin_cache, weights_q, weights_kv)
+
+
+@cache
+def _compile_rope(num_local_heads: int, half_rope_dim: int, pe_dim: int):
+    positions = _fake(Int64, (cute.sym_int(),), (cute.sym_int64(),), align=16)
+    query = _fake(
+        BFloat16,
+        (cute.sym_int(), num_local_heads, pe_dim),
+        (cute.sym_int64(divisibility=2), cute.sym_int64(divisibility=2), 1),
+        align=16,
     )
-    executor = _get_cutedsl_executor(
-        cache_key,
-        kimik25_rmsnorm_special_qkv_fused,
-        data=data_cute,
-        positions=positions_cute,
-        k_pe=k_pe_cute,
-        cos_sin_cache=cos_sin_cache_cute,
-        weights_q=weights_q_cute,
-        weights_kv=weights_kv_cute,
-        lora_dim_q=lora_dim_q,
-        lora_dim_kv=lora_dim_kv,
-        pe_dim=pe_dim,
-        eps_q=eps_q,
-        eps_kv=eps_kv,
-        stream=cutlass_torch.current_stream(),
+    cos_sin_cache = _fake(
+        BFloat16, (cute.sym_int(), pe_dim), (cute.sym_int64(), 1), align=16
     )
-    executor(
-        data=data_cute,
-        positions=positions_cute,
-        k_pe=k_pe_cute,
-        cos_sin_cache=cos_sin_cache_cute,
-        weights_q=weights_q_cute,
-        weights_kv=weights_kv_cute,
-        stream=cutlass_torch.current_stream(),
+    return cute.compile(
+        kimik25_rope,
+        positions,
+        query,
+        cos_sin_cache,
+        num_local_heads,
+        half_rope_dim,
+        _fake_stream(),
+        options="--enable-tvm-ffi",
     )
 
 
@@ -971,33 +972,52 @@ def _run_kimik25_rope(
     num_local_heads: int,
     half_rope_dim: int,
 ) -> None:
-    positions_cute = _make_fully_dynamic_cute_tensor(positions)
-    query_cute = _make_fully_dynamic_cute_tensor(query)
-    cos_sin_cache_cute = from_dlpack(cos_sin_cache, assumed_align=16)
-    cache_key = (
-        "kimik25_rope",
-        _cuda_device_cache_key(),
-        _cutedsl_arg_cache_key(positions_cute),
-        _cutedsl_arg_cache_key(query_cute),
-        _cutedsl_arg_cache_key(cos_sin_cache_cute),
-        num_local_heads,
-        half_rope_dim,
+    _compile_rope(num_local_heads, half_rope_dim, query.shape[2])(
+        positions, query, cos_sin_cache
     )
-    executor = _get_cutedsl_executor(
-        cache_key,
-        kimik25_rope,
-        positions=positions_cute,
-        query=query_cute,
-        cos_sin_cache=cos_sin_cache_cute,
-        N_local=num_local_heads,
-        half_rope_dim=half_rope_dim,
-        stream=cutlass_torch.current_stream(),
+
+
+@cache
+def _compile_decode_rope_concat_quant_fp8(
+    q_lora_dim: int,
+    pe_dim: int,
+    num_local_heads: int,
+):
+    positions = _fake(Int64, (cute.sym_int(),), (cute.sym_int64(),), align=16)
+    ql_nope = _fake(
+        BFloat16,
+        (cute.sym_int(), num_local_heads, q_lora_dim),
+        (cute.sym_int64(divisibility=2), cute.sym_int64(divisibility=2), 1),
+        align=16,
     )
-    executor(
-        positions=positions_cute,
-        query=query_cute,
-        cos_sin_cache=cos_sin_cache_cute,
-        stream=cutlass_torch.current_stream(),
+    q_pe = _fake(
+        BFloat16,
+        (cute.sym_int(), num_local_heads, pe_dim),
+        (cute.sym_int64(divisibility=2), cute.sym_int64(divisibility=2), 1),
+        align=16,
+    )
+    q_out = _fake(
+        Uint8,
+        (cute.sym_int(), num_local_heads, q_lora_dim + pe_dim),
+        (cute.sym_int64(divisibility=2), cute.sym_int64(divisibility=2), 1),
+        align=16,
+    )
+    cos_sin_cache = _fake(
+        BFloat16, (cute.sym_int(), pe_dim), (cute.sym_int64(), 1), align=16
+    )
+    scale = _fake(Float32, (1,), (1,), align=4)
+    return cute.compile(
+        kimik25_decode_rope_concat_quant_fp8,
+        positions,
+        ql_nope,
+        q_pe,
+        q_out,
+        cos_sin_cache,
+        scale,
+        q_lora_dim,
+        pe_dim,
+        _fake_stream(),
+        options="--enable-tvm-ffi",
     )
 
 
@@ -1015,54 +1035,80 @@ def _run_kimik25_decode_rope_concat_quant_fp8(
     assert pe_dim == 64, "Kimi-K2.5 NVFP4 expects qk_rope_head_dim=64"
     assert ql_nope.shape[:2] == q_pe.shape[:2]
 
-    scale = scale.view(1)
     q_out = torch.empty(
         (ql_nope.shape[0], ql_nope.shape[1], q_lora_dim + pe_dim),
         device=ql_nope.device,
         dtype=torch.uint8,
     )
-
-    positions_cute = _make_fully_dynamic_cute_tensor(positions)
-    ql_nope_cute = _make_dynamic_cute_tensor(ql_nope)
-    q_pe_cute = _make_fully_dynamic_cute_tensor(q_pe)
-    q_out_cute = _make_dynamic_cute_tensor(q_out)
-    cos_sin_cache_cute = from_dlpack(cos_sin_cache, assumed_align=16)
-    scale_cute = from_dlpack(scale, assumed_align=4)
-    cache_key = (
-        "kimik25_decode_rope_concat_quant_fp8",
-        _cuda_device_cache_key(),
-        _cutedsl_arg_cache_key(positions_cute),
-        _cutedsl_arg_cache_key(ql_nope_cute),
-        _cutedsl_arg_cache_key(q_pe_cute),
-        _cutedsl_arg_cache_key(q_out_cute),
-        _cutedsl_arg_cache_key(cos_sin_cache_cute),
-        _cutedsl_arg_cache_key(scale_cute),
-        q_lora_dim,
-        pe_dim,
-    )
-    executor = _get_cutedsl_executor(
-        cache_key,
-        kimik25_decode_rope_concat_quant_fp8,
-        positions=positions_cute,
-        ql_nope=ql_nope_cute,
-        q_pe=q_pe_cute,
-        q_out=q_out_cute,
-        cos_sin_cache=cos_sin_cache_cute,
-        scale=scale_cute,
-        q_lora_dim=q_lora_dim,
-        pe_dim=pe_dim,
-        stream=cutlass_torch.current_stream(),
-    )
-    executor(
-        positions=positions_cute,
-        ql_nope=ql_nope_cute,
-        q_pe=q_pe_cute,
-        q_out=q_out_cute,
-        cos_sin_cache=cos_sin_cache_cute,
-        scale=scale_cute,
-        stream=cutlass_torch.current_stream(),
+    _compile_decode_rope_concat_quant_fp8(q_lora_dim, pe_dim, ql_nope.shape[1])(
+        positions, ql_nope, q_pe, q_out, cos_sin_cache, scale.view(1)
     )
     return q_out.view(current_platform.fp8_dtype())
+
+
+@cache
+def _compile_decode_rope_concat_quant_fp8_and_cache_mla(
+    q_lora_dim: int,
+    kv_lora_rank: int,
+    pe_dim: int,
+    kv_cache_block_factor: int,
+    num_local_heads: int,
+):
+    positions = _fake(Int64, (cute.sym_int(),), (cute.sym_int64(),), align=16)
+    ql_nope = _fake(
+        BFloat16,
+        (cute.sym_int(), num_local_heads, q_lora_dim),
+        (cute.sym_int64(divisibility=2), cute.sym_int64(divisibility=2), 1),
+        align=16,
+    )
+    q_pe = _fake(
+        BFloat16,
+        (cute.sym_int(), num_local_heads, pe_dim),
+        (cute.sym_int64(divisibility=2), cute.sym_int64(divisibility=2), 1),
+        align=16,
+    )
+    q_out = _fake(
+        Uint8,
+        (cute.sym_int(), num_local_heads, q_lora_dim + pe_dim),
+        (cute.sym_int64(divisibility=2), cute.sym_int64(divisibility=2), 1),
+        align=16,
+    )
+    cos_sin_cache = _fake(
+        BFloat16, (cute.sym_int(), pe_dim), (cute.sym_int64(), 1), align=16
+    )
+    q_scale = _fake(Float32, (1,), (1,), align=4)
+    kv_c = _fake(
+        BFloat16, (cute.sym_int(), kv_lora_rank), (cute.sym_int64(), 1), align=16
+    )
+    k_pe = _fake(BFloat16, (cute.sym_int(), pe_dim), (cute.sym_int64(), 1), align=16)
+    kv_cache = _fake(
+        Uint8,
+        (cute.sym_int(), cute.sym_int(), kv_lora_rank + pe_dim),
+        (cute.sym_int64(), cute.sym_int64(), 1),
+        align=16,
+    )
+    slot_mapping = _fake(Int64, (cute.sym_int(),), (cute.sym_int64(),), align=16)
+    kv_scale = _fake(Float32, (1,), (1,), align=4)
+    return cute.compile(
+        kimik25_decode_rope_concat_quant_fp8_and_cache_mla,
+        positions,
+        ql_nope,
+        q_pe,
+        q_out,
+        cos_sin_cache,
+        q_scale,
+        kv_c,
+        k_pe,
+        kv_cache,
+        slot_mapping,
+        kv_scale,
+        q_lora_dim,
+        kv_lora_rank,
+        pe_dim,
+        kv_cache_block_factor,
+        _fake_stream(),
+        options="--enable-tvm-ffi",
+    )
 
 
 def _run_kimik25_decode_rope_concat_quant_fp8_and_cache_mla(
@@ -1091,76 +1137,24 @@ def _run_kimik25_decode_rope_concat_quant_fp8_and_cache_mla(
     assert ql_nope.shape[:2] == q_pe.shape[:2]
 
     kv_cache_block_factor = 4
-    q_scale = q_scale.view(1)
-    kv_scale = kv_scale.view(1)
     q_out = torch.empty(
         (ql_nope.shape[0], ql_nope.shape[1], q_lora_dim + pe_dim),
         device=ql_nope.device,
         dtype=torch.uint8,
     )
-
-    positions_cute = _make_fully_dynamic_cute_tensor(positions)
-    ql_nope_cute = _make_dynamic_cute_tensor(ql_nope)
-    q_pe_cute = _make_fully_dynamic_cute_tensor(q_pe)
-    q_out_cute = _make_dynamic_cute_tensor(q_out)
-    cos_sin_cache_cute = from_dlpack(cos_sin_cache, assumed_align=16)
-    q_scale_cute = from_dlpack(q_scale, assumed_align=4)
-    kv_c_cute = _make_dynamic_cute_tensor(kv_c)
-    k_pe_cute = _make_dynamic_cute_tensor(k_pe)
-    kv_cache_cute = _make_dynamic_cute_tensor(kv_cache)
-    slot_mapping_cute = _make_fully_dynamic_cute_tensor(slot_mapping)
-    kv_scale_cute = from_dlpack(kv_scale, assumed_align=4)
-    cache_key = (
-        "kimik25_decode_rope_concat_quant_fp8_and_cache_mla",
-        _cuda_device_cache_key(),
-        _cutedsl_arg_cache_key(positions_cute),
-        _cutedsl_arg_cache_key(ql_nope_cute),
-        _cutedsl_arg_cache_key(q_pe_cute),
-        _cutedsl_arg_cache_key(q_out_cute),
-        _cutedsl_arg_cache_key(cos_sin_cache_cute),
-        _cutedsl_arg_cache_key(q_scale_cute),
-        _cutedsl_arg_cache_key(kv_c_cute),
-        _cutedsl_arg_cache_key(k_pe_cute),
-        _cutedsl_arg_cache_key(kv_cache_cute),
-        _cutedsl_arg_cache_key(slot_mapping_cute),
-        _cutedsl_arg_cache_key(kv_scale_cute),
-        q_lora_dim,
-        kv_lora_rank,
-        pe_dim,
-        kv_cache_block_factor,
-    )
-    executor = _get_cutedsl_executor(
-        cache_key,
-        kimik25_decode_rope_concat_quant_fp8_and_cache_mla,
-        positions=positions_cute,
-        ql_nope=ql_nope_cute,
-        q_pe=q_pe_cute,
-        q_out=q_out_cute,
-        cos_sin_cache=cos_sin_cache_cute,
-        q_scale=q_scale_cute,
-        kv_c=kv_c_cute,
-        k_pe=k_pe_cute,
-        kv_cache=kv_cache_cute,
-        slot_mapping=slot_mapping_cute,
-        kv_scale=kv_scale_cute,
-        q_lora_dim=q_lora_dim,
-        kv_lora_rank=kv_lora_rank,
-        pe_dim=pe_dim,
-        kv_cache_block_factor=kv_cache_block_factor,
-        stream=cutlass_torch.current_stream(),
-    )
-    executor(
-        positions=positions_cute,
-        ql_nope=ql_nope_cute,
-        q_pe=q_pe_cute,
-        q_out=q_out_cute,
-        cos_sin_cache=cos_sin_cache_cute,
-        q_scale=q_scale_cute,
-        kv_c=kv_c_cute,
-        k_pe=k_pe_cute,
-        kv_cache=kv_cache_cute,
-        slot_mapping=slot_mapping_cute,
-        kv_scale=kv_scale_cute,
-        stream=cutlass_torch.current_stream(),
+    _compile_decode_rope_concat_quant_fp8_and_cache_mla(
+        q_lora_dim, kv_lora_rank, pe_dim, kv_cache_block_factor, ql_nope.shape[1]
+    )(
+        positions,
+        ql_nope,
+        q_pe,
+        q_out,
+        cos_sin_cache,
+        q_scale.view(1),
+        kv_c,
+        k_pe,
+        kv_cache,
+        slot_mapping,
+        kv_scale.view(1),
     )
     return q_out.view(current_platform.fp8_dtype())

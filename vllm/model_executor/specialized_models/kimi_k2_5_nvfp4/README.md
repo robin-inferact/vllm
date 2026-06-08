@@ -6,6 +6,10 @@ kernels are checked in ahead of the model so they can be reviewed and tested in
 isolation; the specialized model will import them from [`kernels.py`](./kernels.py)
 once it lands.
 
+This PR scopes the kernels to the **decode** path, which is what we have
+profiled and want to optimize. Two kernels are included; the prefill-path
+kernels are intentionally omitted until they are profiled.
+
 All kernels target **Blackwell (SM10x)** GPUs and require the optional `cutlass`
 (`nvidia-cutlass-dsl`) dependency. They specialize the MLA attention path for
 this checkpoint, which fixes:
@@ -36,54 +40,38 @@ Compilation is cached following the convention in
 
 ## Kernels
 
-Public entry points are the `_run_*` helpers (torch-tensor in / out).
-
-### `_run_kimik25_concat_and_cache_mla`
-FP8-quantizes the MLA latent KV (`kv_c`, 512 dims) and the rotary key part
-(`k_pe`, 64 dims) for each token and writes them into the paged FP8 KV cache at
-the `slot_mapping` slots. Values are divided by `scale` and converted to `e4m3`.
-The grid is one block per `(token, split)`: `split 0` writes the 64 `k_pe`
-elements, `splits 1..kv_cache_block_factor` (4) each write a 128-element chunk of
-`kv_c`. Tokens with `slot_idx < 0` are skipped (padding).
+Public entry points are the `_run_*` helpers (torch-tensor in / out). They map
+onto the two per-token steps of the Kimi-K2.5 MLA decode path.
 
 ### `_run_kimik25_rmsnorm_special_qkv_fused`
-One launch that fuses the per-token work over the fused Q/KV LoRA projection
-(`data`, width `lora_dim_q + lora_dim_kv`, written in place) and the key RoPE
-(`k_pe`, in place). The grid has three block kinds over `Sp` tokens:
-1. Q-LoRA RMSNorm with `weights_q`/`eps_q` (the first three of four column groups,
-   since `lora_dim_q == 3 * lora_dim_kv`),
+Runs once per layer on the full batch, right after the fused QKV-A projection.
+In a single launch it fuses, over the fused Q/KV LoRA projection (`data`, width
+`lora_dim_q + lora_dim_kv`, written in place) and the rotary key (`k_pe`, in
+place):
+1. Q-LoRA RMSNorm with `weights_q`/`eps_q` (the first three of four column
+   groups, since `lora_dim_q == 3 * lora_dim_kv`),
 2. KV-LoRA RMSNorm with `weights_kv`/`eps_kv` (the fourth group),
 3. interleaved RoPE on `k_pe` from `positions` + `cos_sin_cache`.
 
-### `_run_kimik25_rope` (jit: `kimik25_rope`)
-In-place interleaved RoPE on the decode query rotary part `query`
-`(Sp, num_local_heads, 64)`. Each thread rotates `K = 8` heads using
-`cos_sin_cache` indexed by `positions`.
-
-### `_run_kimik25_decode_rope_concat_quant_fp8`
-Decode query path: applies RoPE to `q_pe` `(Sp, num_heads, 64)`, concatenates it
-after `ql_nope` `(Sp, num_heads, 512)`, and FP8-quantizes the full
-576-wide query (divided by `scale`) into a fresh `uint8` buffer returned as FP8.
-Fuses RoPE + concat + quantization in a single launch.
-
 ### `_run_kimik25_decode_rope_concat_quant_fp8_and_cache_mla`
-The decode query path above fused with the KV-cache write: a single linearized
-grid covers both the cache-write blocks (quantizing `kv_c`/`k_pe` by `kv_scale`
-into the paged cache, as in `concat_and_cache_mla`) and the decode-query blocks
-(quantizing the rotated/concatenated query by `q_scale`). Returns the quantized
-query (FP8) and updates `kv_cache` in place.
-
-### `kimi_fused_rmsnorm` (jit launcher)
-A standalone split RMSNorm: the two RMSNorms of
-`rmsnorm_special_qkv_fused` (Q-LoRA with `weights_q`, KV-LoRA with `weights_kv`)
-without the RoPE step, over the fused `data` buffer in place.
+The fused decode-query + KV-cache-write step. A single linearized grid covers
+two halves:
+- **Decode query:** RoPE on `q_pe`, concatenated after `ql_nope`, then
+  FP8-quantized by `q_scale` into a fresh `uint8` buffer returned as FP8 (shape
+  `(num_tokens, num_heads, q_lora_dim + pe_dim)`).
+- **KV-cache write:** `kv_c`/`k_pe` quantized by `kv_scale` and written into the
+  paged FP8 KV cache at the `slot_mapping` slots (tokens with `slot_idx < 0` are
+  skipped). When the batch mixes decode and prefill tokens, the full
+  `slot_mapping` is passed so this single launch writes the cache for the whole
+  batch.
 
 ## Testing
 
-The kernels are validated against PyTorch / vLLM reference implementations in
-[`tests/model_executor/specialized_models/kimi_k2_5_nvfp4`](../../../../tests/model_executor/specialized_models/kimi_k2_5_nvfp4).
-The tests skip automatically unless they run on a Blackwell GPU with `cutlass`
-installed:
+The kernels are validated against PyTorch / vLLM-op reference implementations in
+[`tests/model_executor/specialized_models/kimi_k2_5_nvfp4`](../../../../tests/model_executor/specialized_models/kimi_k2_5_nvfp4)
+(RMSNorm + RoPE references, and `scaled_fp8_quant` / `concat_and_cache_mla` for
+the decode kernel). The tests skip automatically unless they run on a Blackwell
+GPU with `cutlass` installed:
 
 ```bash
 pytest tests/model_executor/specialized_models/kimi_k2_5_nvfp4

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Specialized, checkpoint-specific model implementations.
+"""Checkpoint-specific model implementations.
 
 Each sub-package targets a single checkpoint and trades generality for
 hand-tuned kernels and fused execution paths. The packages here currently

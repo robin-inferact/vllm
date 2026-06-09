@@ -18,7 +18,7 @@ if not torch.cuda.is_available() or not current_platform.is_device_capability_fa
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.torch")
 
-from vllm.model_executor.specialized_models.kimi_k2_5_nvfp4.kernels import (  # noqa: E402
+from vllm.models.kimi_k2_5.nvidia.ops.decode_rope_concat_quant_fp8_and_cache_mla import (  # noqa: E402, E501
     _run_kimik25_decode_rope_concat_quant_fp8_and_cache_mla,
 )
 

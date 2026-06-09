@@ -4,7 +4,6 @@
 import pytest
 import torch
 
-from tests.kernels.allclose_default import get_default_atol, get_default_rtol
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.platforms import current_platform
 
@@ -18,9 +17,14 @@ if not torch.cuda.is_available() or not current_platform.is_device_capability_fa
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.torch")
 
-from vllm.model_executor.specialized_models.kimi_k2_5_nvfp4.kernels import (  # noqa: E402
+from vllm.models.kimi_k2_5.nvidia.ops.rmsnorm_special_qkv_fused import (  # noqa: E402
     _run_kimik25_rmsnorm_special_qkv_fused,
 )
+
+# Default bf16 tolerances, from PyTorch's test_transformers.py
+# (https://github.com/pytorch/pytorch/blob/6d96beb/test/test_transformers.py#L67).
+_BF16_ATOL = 1e-3
+_BF16_RTOL = 1.6e-2
 
 Q_LORA_RANK = 1536
 KV_LORA_RANK = 512
@@ -129,6 +133,6 @@ def test_kimik25_rmsnorm_special_qkv_fused_matches_reference(
     torch.testing.assert_close(
         k_pe,
         expected_k_pe,
-        atol=max(get_default_atol(k_pe), KERNEL_ATOL),
-        rtol=get_default_rtol(k_pe),
+        atol=max(_BF16_ATOL, KERNEL_ATOL),
+        rtol=_BF16_RTOL,
     )

@@ -80,6 +80,18 @@ def kimik25_rmsnorm_special_qkv_fused_kernel(
     eps_q: cutlass.Constexpr,
     eps_kv: cutlass.Constexpr,
 ):
+    """
+    This kernel performs RMSNorm of the low-rank Q and KV, as well
+    as doing RoPE on the part of K subject to RoPE. All updates are in place.
+
+    This assumes that lora_dim_q = 3 * lora_dim_kv.
+
+    This is divided into three groups of blocks:
+     - [0, Sp): Calculate Q-side RMSNorm. Each block handles 3 * lora_dim_kv values
+     - [Sp, 2*Sp): Calculate KV-side RMSNorm. Each block handles lora_dim_kv values
+     - [2*Sp, 3*Sp): RoPE on k_pe. Only the first pe_dim // 2 threads are active,
+       each handling one rotary pair.
+    """
     nwarps = lora_dim_kv // 64
     allocator = cutlass.utils.SmemAllocator()
     sdata = allocator.allocate_tensor(
@@ -230,6 +242,31 @@ def kimik25_decode_rope_concat_quant_fp8_and_cache_mla_kernel(
     pe_dim: cutlass.Constexpr,
     kv_cache_block_factor: cutlass.Constexpr,
 ):
+    """
+    This kernel writes the (already-RoPE'd) latent KV into the paged FP8
+    cache, and builds the FP8 decode query by applying RoPE to the query,
+    concatenating it with the absorbed query, and quantizing.
+
+    All quantization is per-tensor FP8 (e4m3): KV by kv_scale, query by q_scale.
+    This assumes q_lora_dim == kv_lora_rank == 512, pe_dim == 64,
+    q_lora_dim % 256 == 0, and kv_lora_rank % kv_cache_block_factor == 0.
+
+    The grid is linearized and divided into two regions of blocks:
+     - [0, Sp * (kv_cache_block_factor + 1)): KV cache write, with
+       (kv_cache_block_factor + 1) blocks per KV token. Tokens whose slot is
+       negative (padding) are skipped. Each thread writes one element:
+         - split 0: the pe_dim already-RoPE'd K values (k_pe); first pe_dim
+           threads active.
+         - splits 1 .. kv_cache_block_factor: one kv_lora_rank /
+           kv_cache_block_factor chunk of the latent KV (kv_c).
+     - [Sp * (kv_cache_block_factor + 1), end): decode query, with
+       (q_lora_dim // 256 + 1) blocks per (token, head). For each:
+         - block_kind 0 .. q_lora_dim // 256 - 1: quantize one 256-value tile of
+           the absorbed no-RoPE query (ql_nope); each thread handles two values.
+         - the last block_kind: RoPE the pe_dim query (q_pe) and quantize it into
+           the tail of q_out; only the first pe_dim // 2 threads active, each
+           handling one rotary pair.
+    """
     tid, _, _ = cute.arch.thread_idx()
     linear_block, _, _ = cute.arch.block_idx()
 
